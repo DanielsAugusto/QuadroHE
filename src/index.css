@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f3f0ea;
+  --foreground: #1c2a33;
+  --surface: #fffdf8;
+  --muted: #5c6b75;
+  --border: #d7d0c4;
+  --brand: #0f5c63;
+  --brand-dark: #0a4045;
+  --brand-soft: #d8ebee;
+  --accent: #c45c26;
+  --danger: #b42318;
+  --ok: #1f7a4d;
+  --warn: #b54708;
+  --font-sans: "Source Sans 3", "Segoe UI", sans-serif;
+  --font-display: "Fraunces", Georgia, serif;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-brand: var(--brand);
+  --color-brand-dark: var(--brand-dark);
+  --color-brand-soft: var(--brand-soft);
+  --color-accent: var(--accent);
+  --color-danger: var(--danger);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --font-sans: var(--font-sans);
+  --font-display: var(--font-display);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, #e4f1f2 0%, transparent 40%),
+    radial-gradient(circle at bottom right, #f6e6d8 0%, transparent 35%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+h1,
+h2,
+h3,
+.font-display {
+  font-family: var(--font-display);
+}
