@@ -18,7 +18,11 @@ import type { Disciplina } from "@/lib/types";
 
 const emptyForm = { nome: "", codigo: "" };
 
-export function DisciplinasPage() {
+export function DisciplinasPage({
+  embedded = false,
+}: {
+  embedded?: boolean;
+}) {
   const [itens, setItens] = useState<Disciplina[]>([]);
   const [form, setForm] = useState(emptyForm);
   const [editing, setEditing] = useState<Disciplina | null>(null);
@@ -106,17 +110,23 @@ export function DisciplinasPage() {
     }
   }
 
+  const actions = (
+    <button type="button" className={btnPrimary} onClick={abrirNova}>
+      Nova disciplina
+    </button>
+  );
+
   return (
     <div>
-      <PageHeader
-        title="Disciplinas"
-        description="Componentes curriculares usados na HE e nas alocações."
-        actions={
-          <button type="button" className={btnPrimary} onClick={abrirNova}>
-            Nova disciplina
-          </button>
-        }
-      />
+      {embedded ? (
+        <div className="mb-4 flex flex-wrap justify-end gap-2">{actions}</div>
+      ) : (
+        <PageHeader
+          title="Disciplinas"
+          description="Componentes curriculares usados na HE e nas alocações."
+          actions={actions}
+        />
+      )}
       <ErrorBanner message={error} />
 
       <Panel>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   EmptyState,
   ErrorBanner,
@@ -29,6 +29,36 @@ type Ficha = {
   slots: QuadroSlot[];
 };
 
+type LocationState = {
+  from?: string;
+};
+
+function VoltarButton() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const from = (location.state as LocationState | null)?.from;
+
+  return (
+    <button
+      type="button"
+      className={btnSecondary}
+      onClick={() => {
+        if (from) {
+          navigate(from);
+          return;
+        }
+        if (window.history.length > 1) {
+          navigate(-1);
+          return;
+        }
+        navigate("/configuracao?tab=professores");
+      }}
+    >
+      Voltar
+    </button>
+  );
+}
+
 export function FichaProfessorPage() {
   const { matricula } = useParams();
   const [data, setData] = useState<Ficha | null>(null);
@@ -47,9 +77,7 @@ export function FichaProfessorPage() {
     return (
       <div>
         <ErrorBanner message={error} />
-        <Link to="/professores" className={btnSecondary}>
-          Voltar
-        </Link>
+        <VoltarButton />
       </div>
     );
   }
@@ -73,11 +101,7 @@ export function FichaProfessorPage() {
       <PageHeader
         title={p.nome}
         description={`Matrícula ${p.matricula}${p.funcao ? ` · ${p.funcao}` : ""}${p.cargo ? ` · ${p.cargo}` : ""}`}
-        actions={
-          <Link to="/professores" className={btnSecondary}>
-            Voltar
-          </Link>
-        }
+        actions={<VoltarButton />}
       />
 
       <div className="mb-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">

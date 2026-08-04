@@ -5,6 +5,10 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import bcrypt from "bcrypt";
 import { v4 as uuid } from "uuid";
+import {
+  repairMojibakeText,
+  repairMojibakeValue,
+} from "../src/lib/textEncoding.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(__dirname, "..", "data");
@@ -34,12 +38,233 @@ function migrateQuadroSlotsColumns() {
   ensureColumn("quadro_slots", "expira_em", "text");
 }
 
+/** Permite mesma turma+turno com disciplinas diferentes. */
+function migrateQuadrosUniqueComDisciplina() {
+  const row = db
+    .prepare(
+      `select sql from sqlite_master where type = 'table' and name = 'quadros'`,
+    )
+    .get() as { sql: string } | undefined;
+  if (!row?.sql) return;
+  if (
+    /unique\s*\(\s*escola_id\s*,\s*turma_codigo\s*,\s*turno\s*,\s*disciplina_id\s*\)/i.test(
+      row.sql,
+    )
+  ) {
+    return;
+  }
+  if (
+    !/unique\s*\(\s*escola_id\s*,\s*turma_codigo\s*,\s*turno\s*\)/i.test(row.sql)
+  ) {
+    return;
+  }
+
+  db.exec("PRAGMA foreign_keys = OFF;");
+  db.exec("BEGIN");
+  try {
+    db.exec(`
+      create table quadros__new (
+        id text primary key,
+        escola_id text not null references escolas(id) on delete cascade,
+        turma_codigo text not null,
+        turno text not null check (turno in ('MANHA', 'TARDE', 'NOITE')),
+        disciplina_id text references disciplinas(id) on delete set null,
+        observacao text,
+        created_at text not null default (datetime('now')),
+        updated_at text not null default (datetime('now')),
+        unique (escola_id, turma_codigo, turno, disciplina_id)
+      );
+      insert into quadros__new
+        (id, escola_id, turma_codigo, turno, disciplina_id, observacao, created_at, updated_at)
+      select id, escola_id, turma_codigo, turno, disciplina_id, observacao, created_at, updated_at
+      from quadros;
+      drop table quadros;
+      alter table quadros__new rename to quadros;
+      create index if not exists idx_quadros_escola on quadros (escola_id);
+    `);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON;");
+  }
+}
+
 function migrateEscolasColumns() {
   ensureColumn("escolas", "em_carencias", "integer not null default 0");
 }
 
+function migrateProfessoresColumns() {
+  ensureColumn("professores", "extras", "text");
+  ensureColumn("professores", "cgm", "text");
+  ensureColumn("professores", "dt_admiss", "text");
+  ensureColumn("professores", "cod_cargo", "text");
+  ensureColumn("professores", "dt_inicio", "text");
+  ensureColumn("professores", "rescisao", "text");
+  ensureColumn("professores", "escola", "text");
+  ensureColumn("professores", "tipohora", "text");
+  ensureColumn("professores", "cod_lotacao", "text");
+  ensureColumn("professores", "lotacao", "text");
+  ensureColumn("professores", "padrao", "text");
+  ensureColumn("professores", "observacao", "text");
+  ensureColumn("professores", "raca", "text");
+  ensureColumn("professores", "sexo", "text");
+}
+
+function repairProfessoresEncoding() {
+  const marker = "\u00ef\u00bf\u00bd";
+  const needs = db
+    .prepare(
+      `select count(*) as c from professores
+       where instr(ifnull(escola,''), ?) > 0
+          or instr(ifnull(nome,''), ?) > 0
+          or instr(ifnull(funcao,''), ?) > 0
+          or instr(ifnull(lotacao,''), ?) > 0
+          or instr(ifnull(cargo,''), ?) > 0
+          or instr(ifnull(extras,''), ?) > 0
+          or instr(ifnull(observacao,''), ?) > 0`,
+    )
+    .get(marker, marker, marker, marker, marker, marker, marker) as
+    | CountRow
+    | undefined;
+
+  if (!needs || needs.c === 0) return;
+
+  const rows = db
+    .prepare(
+      `select matricula, nome, cargo, funcao, escola, lotacao, observacao, extras
+       from professores
+       where instr(ifnull(escola,''), ?) > 0
+          or instr(ifnull(nome,''), ?) > 0
+          or instr(ifnull(funcao,''), ?) > 0
+          or instr(ifnull(lotacao,''), ?) > 0
+          or instr(ifnull(cargo,''), ?) > 0
+          or instr(ifnull(extras,''), ?) > 0
+          or instr(ifnull(observacao,''), ?) > 0`,
+    )
+    .all(marker, marker, marker, marker, marker, marker, marker) as Array<{
+    matricula: string;
+    nome: string;
+    cargo: string | null;
+    funcao: string | null;
+    escola: string | null;
+    lotacao: string | null;
+    observacao: string | null;
+    extras: string | null;
+  }>;
+
+  const update = db.prepare(
+    `update professores set
+       nome = ?, cargo = ?, funcao = ?, escola = ?, lotacao = ?,
+       observacao = ?, extras = ?, updated_at = datetime('now')
+     where matricula = ?`,
+  );
+
+  let fixed = 0;
+  db.exec("BEGIN");
+  try {
+    for (const row of rows) {
+      let extras: string | null = row.extras;
+      if (extras) {
+        try {
+          const parsed = JSON.parse(extras) as unknown;
+          extras = JSON.stringify(repairMojibakeValue(parsed));
+        } catch {
+          extras = repairMojibakeText(extras);
+        }
+      }
+      update.run(
+        repairMojibakeText(row.nome) ?? row.nome,
+        repairMojibakeText(row.cargo),
+        repairMojibakeText(row.funcao),
+        repairMojibakeText(row.escola),
+        repairMojibakeText(row.lotacao),
+        repairMojibakeText(row.observacao),
+        extras,
+        row.matricula,
+      );
+      fixed += 1;
+    }
+    db.exec("COMMIT");
+    console.log(`Encoding reparado em ${fixed} professor(es).`);
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    console.error("Falha ao reparar encoding:", err);
+  }
+}
+
 function migrateHorasExtraColumns() {
   ensureColumn("horas_extra", "unidade", "text not null default 'TEMPOS'");
+}
+
+/** Copia lotações legadas da tabela professores (1x) para professor_lotacoes. */
+function migrateProfessorLotacoesFromProfessores() {
+  const count = db
+    .prepare("select count(*) as c from professor_lotacoes")
+    .get() as CountRow | undefined;
+  if (count && count.c > 0) return;
+
+  const rows = db
+    .prepare(
+      `select matricula, escola, tipohora, cod_lotacao, lotacao, padrao, funcao, dt_inicio, observacao
+       from professores
+       where trim(ifnull(escola,'')) != ''
+          or trim(ifnull(tipohora,'')) != ''
+          or trim(ifnull(lotacao,'')) != ''`,
+    )
+    .all() as Array<{
+    matricula: string;
+    escola: string | null;
+    tipohora: string | null;
+    cod_lotacao: string | null;
+    lotacao: string | null;
+    padrao: string | null;
+    funcao: string | null;
+    dt_inicio: string | null;
+    observacao: string | null;
+  }>;
+
+  if (rows.length === 0) return;
+
+  const insert = db.prepare(
+    `insert or ignore into professor_lotacoes (
+       id, matricula, escola, tipohora, cod_lotacao, lotacao, padrao, funcao, dt_inicio, observacao
+     ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+
+  db.exec("BEGIN");
+  try {
+    for (const row of rows) {
+      insert.run(
+        uuid(),
+        row.matricula,
+        row.escola,
+        row.tipohora,
+        row.cod_lotacao,
+        row.lotacao,
+        row.padrao,
+        row.funcao,
+        row.dt_inicio,
+        row.observacao,
+      );
+    }
+    db.exec("COMMIT");
+    console.log(
+      `Migradas ${rows.length} lotação(ões) legadas para professor_lotacoes.`,
+    );
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    console.error("Falha ao migrar lotações:", err);
+  }
 }
 
 export function initDb() {
@@ -57,6 +282,20 @@ export function initDb() {
       nome text not null,
       cargo text,
       funcao text,
+      cgm text,
+      dt_admiss text,
+      cod_cargo text,
+      dt_inicio text,
+      rescisao text,
+      escola text,
+      tipohora text,
+      cod_lotacao text,
+      lotacao text,
+      padrao text,
+      observacao text,
+      raca text,
+      sexo text,
+      extras text,
       created_at text not null default (datetime('now')),
       updated_at text not null default (datetime('now'))
     );
@@ -113,7 +352,7 @@ export function initDb() {
       observacao text,
       created_at text not null default (datetime('now')),
       updated_at text not null default (datetime('now')),
-      unique (escola_id, turma_codigo, turno)
+      unique (escola_id, turma_codigo, turno, disciplina_id)
     );
 
     create table if not exists quadro_slots (
@@ -137,11 +376,40 @@ export function initDb() {
     create index if not exists idx_horas_extra_vigencia on horas_extra (inicio, termino);
     create index if not exists idx_alocacoes_matricula_status on alocacoes (matricula, status);
     create index if not exists idx_professores_nome on professores (nome collate nocase);
+
+    create table if not exists professor_lotacoes (
+      id text primary key,
+      matricula text not null references professores(matricula) on delete cascade,
+      escola text,
+      tipohora text,
+      cod_lotacao text,
+      lotacao text,
+      padrao text,
+      funcao text,
+      dt_inicio text,
+      observacao text,
+      created_at text not null default (datetime('now')),
+      updated_at text not null default (datetime('now'))
+    );
+
+    create index if not exists idx_prof_lotacoes_matricula on professor_lotacoes (matricula);
+    create index if not exists idx_prof_lotacoes_escola on professor_lotacoes (escola);
+    create unique index if not exists idx_prof_lotacoes_natural on professor_lotacoes (
+      matricula,
+      ifnull(tipohora, ''),
+      ifnull(escola, ''),
+      ifnull(cod_lotacao, ''),
+      ifnull(lotacao, '')
+    );
   `);
 
   migrateQuadroSlotsColumns();
   migrateEscolasColumns();
+  migrateProfessoresColumns();
   migrateHorasExtraColumns();
+  migrateQuadrosUniqueComDisciplina();
+  repairProfessoresEncoding();
+  migrateProfessorLotacoesFromProfessores();
 
   const discCount = db.prepare("select count(*) as c from disciplinas").get() as
     | CountRow

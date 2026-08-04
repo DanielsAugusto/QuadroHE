@@ -264,6 +264,7 @@ export function AlocacoesPage() {
                     <td className="px-2 py-2">
                       <Link
                         to={`/professores/${a.matricula}`}
+                        state={{ from: "/alocacoes" }}
                         className="text-brand underline-offset-2 hover:underline"
                       >
                         {a.professor_nome ?? a.matricula}

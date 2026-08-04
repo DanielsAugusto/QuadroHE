@@ -77,7 +77,7 @@ function parseEscolasExcel(buffer: ArrayBuffer) {
   });
 }
 
-export function EscolasPage() {
+export function EscolasPage({ embedded = false }: { embedded?: boolean }) {
   const [itens, setItens] = useState<Escola[]>([]);
   const [total, setTotal] = useState(0);
   const [nome, setNome] = useState("");
@@ -204,34 +204,40 @@ export function EscolasPage() {
     }
   }
 
+  const actions = (
+    <>
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".xlsx,.xls,.csv"
+        className="hidden"
+        onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
+      />
+      <button
+        type="button"
+        className={btnSecondary}
+        disabled={importing}
+        onClick={() => fileRef.current?.click()}
+      >
+        {importing ? "Importando..." : "Importar Excel"}
+      </button>
+      <button type="button" className={btnPrimary} onClick={abrirNova}>
+        Nova escola
+      </button>
+    </>
+  );
+
   return (
     <div>
-      <PageHeader
-        title="Escolas"
-        description="Cadastro das unidades onde os tempos são alocados."
-        actions={
-          <>
-            <input
-              ref={fileRef}
-              type="file"
-              accept=".xlsx,.xls,.csv"
-              className="hidden"
-              onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
-            />
-            <button
-              type="button"
-              className={btnSecondary}
-              disabled={importing}
-              onClick={() => fileRef.current?.click()}
-            >
-              {importing ? "Importando..." : "Importar Excel"}
-            </button>
-            <button type="button" className={btnPrimary} onClick={abrirNova}>
-              Nova escola
-            </button>
-          </>
-        }
-      />
+      {embedded ? (
+        <div className="mb-4 flex flex-wrap justify-end gap-2">{actions}</div>
+      ) : (
+        <PageHeader
+          title="Escolas"
+          description="Cadastro das unidades onde os tempos são alocados."
+          actions={actions}
+        />
+      )}
       <ErrorBanner message={error} />
 
       <Panel>

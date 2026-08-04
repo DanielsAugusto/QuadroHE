@@ -61,9 +61,15 @@ function SortMark({ active, dir }: { active: boolean; dir: SortDir }) {
 
 function MiniGrade({ quadro }: { quadro: Quadro }) {
   const map = useMemo(() => {
-    const m = new Map<string, { matricula: string | null }>();
+    const m = new Map<
+      string,
+      { matricula: string | null; tipo: string | null }
+    >();
     for (const s of quadro.slots_preview ?? []) {
-      m.set(`${s.dia}:${s.periodo}`, { matricula: s.matricula });
+      m.set(`${s.dia}:${s.periodo}`, {
+        matricula: s.matricula,
+        tipo: s.tipo ?? "REAL",
+      });
     }
     return m;
   }, [quadro.slots_preview]);
@@ -97,23 +103,30 @@ function MiniGrade({ quadro }: { quadro: Quadro }) {
               </td>
               {DIAS.map((d) => {
                 const slot = map.get(`${d.id}:${periodo}`);
+                const coberta = !!slot?.matricula;
+                const temporaria = slot?.tipo === "TEMPORARIA";
+                let cellClass = "bg-white";
+                let titulo = "Vazio";
+                if (slot) {
+                  if (coberta && temporaria) {
+                    cellClass = "bg-orange-200";
+                    titulo = "Temporária com professor";
+                  } else if (coberta) {
+                    cellClass = "bg-emerald-200";
+                    titulo = "Real com professor";
+                  } else if (temporaria) {
+                    cellClass = "bg-rose-200";
+                    titulo = "Temporária em aberto";
+                  } else {
+                    cellClass = "bg-sky-200";
+                    titulo = "Real em aberto";
+                  }
+                }
                 return (
                   <td
                     key={d.id}
-                    className={`h-3.5 border-l border-t border-border p-0 ${
-                      !slot
-                        ? "bg-white"
-                        : slot.matricula
-                          ? "bg-emerald-400/80"
-                          : "bg-sky-300/80"
-                    }`}
-                    title={
-                      !slot
-                        ? "Vazio"
-                        : slot.matricula
-                          ? "Com professor"
-                          : "Carência aberta"
-                    }
+                    className={`h-3.5 border-l border-t border-border p-0 ${cellClass}`}
+                    title={titulo}
                   />
                 );
               })}
@@ -131,7 +144,8 @@ export function EscolaQuadrosPage() {
   const [quadros, setQuadros] = useState<Quadro[]>([]);
   const [disciplinas, setDisciplinas] = useState<Disciplina[]>([]);
   const [modalAberto, setModalAberto] = useState(false);
-  const [turma, setTurma] = useState("");
+  const [turmas, setTurmas] = useState<string[]>([]);
+  const [turmaInput, setTurmaInput] = useState("");
   const [turno, setTurno] = useState<Turno>("MANHA");
   const [disciplinaId, setDisciplinaId] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -208,7 +222,8 @@ export function EscolaQuadrosPage() {
   }
 
   function abrirModal() {
-    setTurma("");
+    setTurmas([]);
+    setTurmaInput("");
     setTurno("MANHA");
     setDisciplinaId("");
     setFormError(null);
@@ -221,16 +236,56 @@ export function EscolaQuadrosPage() {
     setFormError(null);
   }
 
+  function adicionarTurmasDoTexto(texto: string) {
+    const parts = texto
+      .split(/[,;\s]+/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (parts.length === 0) return;
+    setTurmas((prev) => {
+      const set = new Set(prev.map((t) => t.toUpperCase()));
+      const next = [...prev];
+      for (const p of parts) {
+        const key = p.toUpperCase();
+        if (set.has(key)) continue;
+        set.add(key);
+        next.push(p);
+      }
+      return next;
+    });
+    setTurmaInput("");
+  }
+
+  function removerTurma(codigo: string) {
+    setTurmas((prev) => prev.filter((t) => t !== codigo));
+  }
+
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     if (!escolaId) return;
+
+    const lista = [...turmas];
+    const pending = turmaInput.trim();
+    if (pending) {
+      for (const p of pending.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean)) {
+        if (!lista.some((t) => t.toUpperCase() === p.toUpperCase())) {
+          lista.push(p);
+        }
+      }
+    }
+
+    if (lista.length === 0) {
+      setFormError("Informe ao menos uma turma.");
+      return;
+    }
+
     setLoading(true);
     setFormError(null);
     try {
-      await api(`/escolas/${escolaId}/quadros`, {
+      await api(`/escolas/${escolaId}/quadros/lote`, {
         method: "POST",
         body: JSON.stringify({
-          turma_codigo: turma.trim(),
+          turmas: lista,
           turno,
           disciplina_id: disciplinaId || null,
         }),
@@ -267,7 +322,7 @@ export function EscolaQuadrosPage() {
     <div>
       <PageHeader
         title={escola?.nome ?? "Escola"}
-        description="Cada card é um quadro de turma, com miniatura dos horários preenchidos."
+        description="Cada card é um quadro de turma. Turmas do mesmo turno e disciplina compartilham a grade ao abrir."
         actions={
           <>
             <button type="button" className={btnPrimary} onClick={abrirModal}>
@@ -298,11 +353,23 @@ export function EscolaQuadrosPage() {
               </button>
             );
           })}
-          <span className="ml-2 text-[11px] text-muted">
-            <span className="mr-2 inline-block h-2.5 w-2.5 rounded-sm bg-sky-300/80 align-middle" />
-            aberto
-            <span className="ml-3 mr-2 inline-block h-2.5 w-2.5 rounded-sm bg-emerald-400/80 align-middle" />
-            com professor
+          <span className="ml-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted">
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-sky-200" />
+              Real aberto
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-rose-200" />
+              Temp. aberto
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-orange-200" />
+              Temp. c/ prof.
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-200" />
+              Real c/ prof.
+            </span>
           </span>
         </div>
       ) : null}
@@ -375,7 +442,7 @@ export function EscolaQuadrosPage() {
                 id="modal-novo-quadro-titulo"
                 className="font-display text-xl font-semibold text-brand-dark"
               >
-                Novo quadro (turma)
+                Novo quadro (turmas)
               </h2>
               <button
                 type="button"
@@ -390,15 +457,59 @@ export function EscolaQuadrosPage() {
             <ErrorBanner message={formError} />
 
             <form onSubmit={onSubmit} className="space-y-3">
-              <Field label="Código da turma">
-                <input
-                  className={inputClass}
-                  required
-                  autoFocus
-                  value={turma}
-                  placeholder="ex: 914-PT"
-                  onChange={(e) => setTurma(e.target.value)}
-                />
+              <Field label="Turmas">
+                <div className="rounded-lg border border-border bg-white px-2 py-2 focus-within:ring-2 focus-within:ring-brand/30">
+                  {turmas.length > 0 ? (
+                    <div className="mb-2 flex flex-wrap gap-1.5">
+                      {turmas.map((t) => (
+                        <span
+                          key={t}
+                          className="inline-flex items-center gap-1 rounded-md bg-brand-soft px-2 py-1 text-xs font-semibold text-brand-dark"
+                        >
+                          {t}
+                          <button
+                            type="button"
+                            className="rounded text-brand hover:text-danger"
+                            aria-label={`Remover turma ${t}`}
+                            onClick={() => removerTurma(t)}
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  <input
+                    className="w-full bg-transparent text-sm outline-none"
+                    autoFocus
+                    value={turmaInput}
+                    placeholder={
+                      turmas.length === 0
+                        ? "ex: 611 612 613 — Enter ou vírgula para adicionar"
+                        : "Mais uma turma…"
+                    }
+                    onChange={(e) => setTurmaInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === "," || e.key === ";") {
+                        e.preventDefault();
+                        adicionarTurmasDoTexto(turmaInput);
+                      }
+                      if (
+                        e.key === "Backspace" &&
+                        !turmaInput &&
+                        turmas.length > 0
+                      ) {
+                        removerTurma(turmas[turmas.length - 1]!);
+                      }
+                    }}
+                    onBlur={() => {
+                      if (turmaInput.trim()) adicionarTurmasDoTexto(turmaInput);
+                    }}
+                  />
+                </div>
+                <p className="mt-1 text-xs text-muted">
+                  Pode criar várias turmas de uma vez no mesmo turno e disciplina.
+                </p>
               </Field>
               <Field label="Turno">
                 <select
@@ -411,7 +522,7 @@ export function EscolaQuadrosPage() {
                   <option value="NOITE">Noite</option>
                 </select>
               </Field>
-              <Field label="Disciplina (opcional)">
+              <Field label="Disciplina">
                 <select
                   className={inputClass}
                   value={disciplinaId}
@@ -424,6 +535,10 @@ export function EscolaQuadrosPage() {
                     </option>
                   ))}
                 </select>
+                <p className="mt-1 text-xs text-muted">
+                  Pode repetir as mesmas turmas e turno se a disciplina for outra
+                  (ex.: Manhã · ART e Manhã · MAT).
+                </p>
               </Field>
               <div className="flex justify-end gap-2 pt-2">
                 <button
@@ -435,7 +550,13 @@ export function EscolaQuadrosPage() {
                   Cancelar
                 </button>
                 <button className={btnPrimary} disabled={loading}>
-                  {loading ? "Criando..." : "Criar quadro"}
+                  {loading
+                    ? "Criando..."
+                    : turmas.length > 1 ||
+                        (turmas.length === 0 &&
+                          /[,;\s]/.test(turmaInput.trim()))
+                      ? "Criar quadros"
+                      : "Criar quadro"}
                 </button>
               </div>
             </form>

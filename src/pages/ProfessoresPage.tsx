@@ -20,6 +20,7 @@ import {
   Panel,
   btnPrimary,
   btnSecondary,
+  btnDanger,
   inputClass,
 } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -31,64 +32,334 @@ const PAGE_SIZE = 20;
 type ImportResult = {
   criados: number;
   atualizados: number;
+  lotacoes?: number;
   ignorados: number;
   erros: string[];
 };
 
+import { decodeSpreadsheetText, repairMojibakeText } from "@/lib/textEncoding";
+
+function detectCsvDelimiter(sample: string): string {
+  const first = (sample.split(/\r?\n/).find((l) => l.trim()) ?? "").slice(
+    0,
+    500,
+  );
+  const semis = (first.match(/;/g) ?? []).length;
+  const commas = (first.match(/,/g) ?? []).length;
+  return semis >= commas ? ";" : ",";
+}
+
+function looksLikeCsv(buffer: ArrayBuffer, fileName?: string): boolean {
+  if (fileName?.toLowerCase().endsWith(".csv")) return true;
+  const head = decodeSpreadsheetText(buffer.slice(0, 200));
+  return (
+    head.includes(";") &&
+    /matricula|nome/i.test(head) &&
+    !head.includes("PK\u0003\u0004")
+  );
+}
+
+function readProfessoresWorkbook(buffer: ArrayBuffer, fileName?: string) {
+  if (looksLikeCsv(buffer, fileName)) {
+    const text = decodeSpreadsheetText(buffer);
+    const FS = detectCsvDelimiter(text);
+    return XLSX.read(text, { type: "string", FS, cellDates: true });
+  }
+  return XLSX.read(buffer, { type: "array", cellDates: true });
+}
+
 function normalizeHeader(value: string) {
-  return value
+  let n = value
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\uFFFD/g, "")
     .trim()
     .toUpperCase()
-    .replace(/\s+/g, "_");
+    .replace(/º|°/g, "")
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "");
+
+  // CSV com encoding quebrado: "Matrícula" → MATRI_CULA / MATRCULA
+  if (/^MATR[I_]*CULA$/.test(n) || n === "MATRCULA") return "MATRICULA";
+  if (/^OBSERV/.test(n)) return "OBSERVACAO";
+  return n;
 }
 
-function cellStr(row: Record<string, unknown>, keys: string[]) {
-  for (const key of keys) {
+function cellRaw(
+  row: Record<string, unknown>,
+  aliases: string[],
+): unknown {
+  for (const key of aliases) {
+    if (!(key in row)) continue;
     const raw = row[key];
     if (raw === undefined || raw === null) continue;
-    const text = String(raw).trim();
-    if (text) return text;
+    if (typeof raw === "string" && !raw.trim()) continue;
+    return raw;
   }
-  return "";
+  const keys = Object.keys(row);
+  for (const alias of aliases) {
+    const hit = keys.find(
+      (k) =>
+        k === alias ||
+        k.startsWith(`${alias}_`) ||
+        (alias.length >= 4 && k.includes(alias)),
+    );
+    if (!hit) continue;
+    const raw = row[hit];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw === "string" && !raw.trim()) continue;
+    return raw;
+  }
+  return undefined;
 }
 
-function parseProfessoresExcel(buffer: ArrayBuffer) {
-  const wb = XLSX.read(buffer, { type: "array" });
-  const sheet = wb.Sheets[wb.SheetNames[0]];
-  if (!sheet) throw new Error("Planilha vazia");
+function cellStr(row: Record<string, unknown>, aliases: string[]) {
+  const raw = cellRaw(row, aliases);
+  if (raw === undefined || raw === null) return "";
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    if (Number.isInteger(raw) || Math.abs(raw - Math.round(raw)) < 1e-9) {
+      return String(Math.round(raw));
+    }
+    return String(raw);
+  }
+  return repairMojibakeText(String(raw).trim()) ?? "";
+}
 
+function findHeaderRowIndex(sheet: XLSX.WorkSheet): number {
+  const rows = XLSX.utils.sheet_to_json<Array<string | number | null>>(
+    sheet,
+    { header: 1, defval: "", raw: false },
+  ) as Array<Array<string | number | null>>;
+
+  for (let i = 0; i < Math.min(rows.length, 40); i++) {
+    const cells = (rows[i] ?? []).map((c) => normalizeHeader(String(c ?? "")));
+    const hasMat =
+      cells.includes("MATRICULA") ||
+      cells.includes("MAT") ||
+      cells.includes("CGM");
+    const hasNome = cells.some(
+      (c) => c === "NOME" || c.startsWith("NOME_") || c.includes("FUNCIONARIO"),
+    );
+    if (hasMat && hasNome) return i;
+    if (hasMat && cells.some((c) => c === "CARGO" || c.startsWith("FUNCAO"))) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+function extrasValue(value: unknown): string | number | null {
+  if (value === null || value === undefined || value === "") return null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    const y = value.getFullYear();
+    const m = String(value.getMonth() + 1).padStart(2, "0");
+    const d = String(value.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (Number.isInteger(value) || Math.abs(value - Math.round(value)) < 1e-9) {
+      return Math.round(value);
+    }
+    return value;
+  }
+  const text = String(value).trim();
+  return text || null;
+}
+
+function parseDateField(value: unknown): string | null {
+  const v = extrasValue(value);
+  if (v === null) return null;
+  if (typeof v === "number") {
+    // Excel serial date
+    const utc = Date.UTC(1899, 11, 30) + Math.round(v) * 86400000;
+    return new Date(utc).toISOString().slice(0, 10);
+  }
+  const s = String(v).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const br = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (br) {
+    return `${br[3]}-${br[2].padStart(2, "0")}-${br[1].padStart(2, "0")}`;
+  }
+  return s || null;
+}
+
+function parseSheetProfessores(sheet: XLSX.WorkSheet) {
+  const headerRow = findHeaderRowIndex(sheet);
   const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
     defval: "",
-    raw: false,
+    raw: true,
+    range: headerRow,
   });
-
-  if (rawRows.length === 0) {
-    throw new Error("Nenhuma linha encontrada na planilha");
-  }
 
   return rawRows.map((row) => {
     const mapped: Record<string, unknown> = {};
+    const extras: Record<string, string | number> = {};
+
     for (const [key, value] of Object.entries(row)) {
-      mapped[normalizeHeader(key)] = value;
+      const label = String(key).trim();
+      if (!label || label.startsWith("__")) continue;
+      const norm = normalizeHeader(label);
+      if (!norm || norm.startsWith("EMPTY")) continue;
+
+      const serialized = extrasValue(value);
+      if (serialized !== null) {
+        const key = repairMojibakeText(label) ?? label;
+        extras[key] =
+          typeof serialized === "string"
+            ? (repairMojibakeText(serialized) ?? serialized)
+            : serialized;
+      }
+
+      if (
+        mapped[norm] !== undefined &&
+        mapped[norm] !== null &&
+        String(mapped[norm]).trim() !== ""
+      ) {
+        continue;
+      }
+      mapped[norm] = value;
     }
+
     return {
-      matricula: cellStr(mapped, ["MATRICULA", "MAT"]),
-      nome: cellStr(mapped, ["NOME"]),
+      matricula: cellStr(mapped, ["MATRICULA", "MAT", "MATRIC"]),
+      cgm: cellStr(mapped, ["CGM"]) || null,
+      dt_admiss: parseDateField(
+        cellRaw(mapped, [
+          "DT_ADMISS",
+          "DT_ADMISSAO",
+          "DATA_ADMISSAO",
+        ]),
+      ),
+      nome: cellStr(mapped, [
+        "NOME",
+        "NOME_DO_U",
+        "NOME_DO_USUARIO",
+        "NOME_DO_SERVIDOR",
+        "FUNCIONARIO",
+        "PROFESSOR",
+      ]),
+      cod_cargo: cellStr(mapped, ["COD_CARGO", "CODIGO_CARGO"]) || null,
       cargo: cellStr(mapped, ["CARGO"]) || null,
-      funcao: cellStr(mapped, ["FUNCAO", "FUNÇÃO"]) || null,
+      dt_inicio: parseDateField(
+        cellRaw(mapped, [
+          "DT_INICIO",
+          "DT_INICIO_",
+          "DT_INICIO_FUNCAO",
+          "DATA_INICIO",
+          "DATA_INICIO_FUNCAO",
+        ]),
+      ),
+      funcao:
+        cellStr(mapped, [
+          "FUNCAO",
+          "FUNCAO_NA",
+          "FUNCAO_NA_ESCOLA",
+          "FUNCAO_DO_SERVIDOR",
+        ]) || null,
+      rescisao:
+        cellStr(mapped, ["RESCISAO", "DT_RESCISAO", "DATA_RESCISAO"]) || null,
+      escola: cellStr(mapped, ["ESCOLA", "UNIDADE", "LOTACAO_ESCOLA"]) || null,
+      tipohora: cellStr(mapped, ["TIPOHORA", "TIPO_HORA", "TIPO_DE_HORA"]) || null,
+      cod_lotacao: cellStr(mapped, ["COD_LOTAC", "COD_LOTACAO", "CODIGO_LOTACAO"]) || null,
+      lotacao: cellStr(mapped, ["LOTACAO", "LOTACAO_ORIGEM"]) || null,
+      padrao: cellStr(mapped, ["PADRAO"]) || null,
+      observacao: cellStr(mapped, ["OBSERVACAO", "OBS", "OBSERVACOES"]) || null,
+      raca: cellStr(mapped, ["RACA"]) || null,
+      sexo: cellStr(mapped, ["SEXO"]) || null,
+      extras,
+      _headers: Object.keys(mapped),
     };
   });
 }
 
-export function ProfessoresPage() {
+function parseProfessoresExcel(buffer: ArrayBuffer, fileName?: string) {
+  const wb = readProfessoresWorkbook(buffer, fileName);
+  if (!wb.SheetNames.length) throw new Error("Planilha vazia");
+
+  let best: ReturnType<typeof parseSheetProfessores> = [];
+  let bestHeaders: string[] = [];
+
+  for (const name of wb.SheetNames) {
+    const sheet = wb.Sheets[name];
+    if (!sheet) continue;
+    const rows = parseSheetProfessores(sheet);
+    const valid = rows.filter((r) => r.matricula && r.nome);
+    if (valid.length > best.filter((r) => r.matricula && r.nome).length) {
+      best = rows;
+      bestHeaders = rows[0]?._headers ?? [];
+    }
+  }
+
+  const itens = best
+    .filter((r) => r.matricula || r.nome)
+    .map(
+      ({
+        matricula,
+        nome,
+        cargo,
+        funcao,
+        cgm,
+        dt_admiss,
+        cod_cargo,
+        dt_inicio,
+        rescisao,
+        escola,
+        tipohora,
+        cod_lotacao,
+        lotacao,
+        padrao,
+        observacao,
+        raca,
+        sexo,
+        extras,
+      }) => ({
+        matricula,
+        nome,
+        cargo,
+        funcao,
+        cgm,
+        dt_admiss,
+        cod_cargo,
+        dt_inicio,
+        rescisao,
+        escola,
+        tipohora,
+        cod_lotacao,
+        lotacao,
+        padrao,
+        observacao,
+        raca,
+        sexo,
+        extras: Object.keys(extras).length > 0 ? extras : null,
+      }),
+    );
+
+  if (itens.length === 0) {
+    const dica =
+      bestHeaders.length > 0
+        ? ` Colunas encontradas: ${bestHeaders.slice(0, 12).join(", ")}.`
+        : " Não foi possível ler o cabeçalho.";
+    throw new Error(
+      `Nenhum professor com matrícula e nome encontrado na planilha.${dica}`,
+    );
+  }
+
+  return itens;
+}
+
+export function ProfessoresPage({
+  embedded = false,
+}: {
+  embedded?: boolean;
+}) {
   const [itens, setItens] = useState<Professor[]>([]);
   const [total, setTotal] = useState(0);
   const [form, setForm] = useState(emptyForm);
   const [editing, setEditing] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<Professor | null>(null);
+  const [pendingDeleteAll, setPendingDeleteAll] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
@@ -197,13 +468,31 @@ export function ProfessoresPage() {
     }
   }
 
+  async function confirmarExclusaoTudo() {
+    setDeleting(true);
+    try {
+      await api<{ deleted: number }>("/professores", { method: "DELETE" });
+      setPendingDeleteAll(false);
+      setPage(1);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erro ao excluir tudo");
+      setPendingDeleteAll(false);
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function onImportFile(file: File | null) {
     if (!file) return;
     setImporting(true);
     setError(null);
     try {
       const buffer = await file.arrayBuffer();
-      const itensImport = parseProfessoresExcel(buffer);
+      const itensImport = parseProfessoresExcel(buffer, file.name);
+      if (itensImport.length === 0) {
+        throw new Error("Nenhum registro válido para importar");
+      }
       const result = await api<ImportResult>("/professores/import", {
         method: "POST",
         body: JSON.stringify({ itens: itensImport }),
@@ -222,34 +511,48 @@ export function ProfessoresPage() {
   const inicio = total === 0 ? 0 : (pageSafe - 1) * PAGE_SIZE + 1;
   const fim = Math.min(pageSafe * PAGE_SIZE, total);
 
+  const actions = (
+    <>
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".xlsx,.xls,.csv"
+        className="hidden"
+        onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
+      />
+      <button
+        type="button"
+        className={btnDanger}
+        disabled={importing || deleting || (total === 0 && !busca.trim())}
+        onClick={() => setPendingDeleteAll(true)}
+      >
+        Apagar tudo
+      </button>
+      <button
+        type="button"
+        className={btnSecondary}
+        disabled={importing}
+        onClick={() => fileRef.current?.click()}
+      >
+        {importing ? "Importando..." : "Importar Excel"}
+      </button>
+      <button type="button" className={btnPrimary} onClick={abrirNovo}>
+        Novo professor
+      </button>
+    </>
+  );
+
   return (
     <div>
-      <PageHeader
-        title="Professores"
-        description="Cadastro pela matrícula — chave que liga Hora Extra e alocações."
-        actions={
-          <>
-            <input
-              ref={fileRef}
-              type="file"
-              accept=".xlsx,.xls,.csv"
-              className="hidden"
-              onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
-            />
-            <button
-              type="button"
-              className={btnSecondary}
-              disabled={importing}
-              onClick={() => fileRef.current?.click()}
-            >
-              {importing ? "Importando..." : "Importar Excel"}
-            </button>
-            <button type="button" className={btnPrimary} onClick={abrirNovo}>
-              Novo professor
-            </button>
-          </>
-        }
-      />
+      {embedded ? (
+        <div className="mb-4 flex flex-wrap justify-end gap-2">{actions}</div>
+      ) : (
+        <PageHeader
+          title="Professores"
+          description="Cadastro pela matrícula — chave que liga Hora Extra e alocações."
+          actions={actions}
+        />
+      )}
       <ErrorBanner message={error} />
 
       <Panel>
@@ -301,6 +604,7 @@ export function ProfessoresPage() {
                       <td className="px-2 py-2">
                         <Link
                           to={`/professores/${p.matricula}`}
+                          state={{ from: "/configuracao?tab=professores" }}
                           className="text-brand underline-offset-2 hover:underline"
                         >
                           {p.matricula}
@@ -426,14 +730,22 @@ export function ProfessoresPage() {
           <div className="space-y-3 text-sm">
             <p>
               <span className="font-medium text-ok">{importResult.criados}</span>{" "}
-              criado(s)
+              professor(es) criado(s)
             </p>
             <p>
               <span className="font-medium text-brand">
                 {importResult.atualizados}
               </span>{" "}
-              atualizado(s)
+              professor(es) atualizado(s)
             </p>
+            {typeof importResult.lotacoes === "number" ? (
+              <p>
+                <span className="font-medium text-brand">
+                  {importResult.lotacoes}
+                </span>{" "}
+                lotação(ões) gravada(s) (NORMAL + hora extra)
+              </p>
+            ) : null}
             <p>
               <span className="font-medium text-muted">
                 {importResult.ignorados}
@@ -474,6 +786,18 @@ export function ProfessoresPage() {
         onConfirm={() => void confirmarExclusao()}
         onClose={() => {
           if (!deleting) setPendingDelete(null);
+        }}
+      />
+
+      <ConfirmDialog
+        open={pendingDeleteAll}
+        title="Apagar todos os professores"
+        message="Isso vai excluir permanentemente TODOS os professores e também lotações, horas extras e alocações vinculadas às matrículas. Esta ação não pode ser desfeita."
+        confirmLabel="Apagar tudo"
+        loading={deleting}
+        onConfirm={() => void confirmarExclusaoTudo()}
+        onClose={() => {
+          if (!deleting) setPendingDeleteAll(false);
         }}
       />
     </div>

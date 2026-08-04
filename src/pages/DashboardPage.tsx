@@ -152,6 +152,7 @@ export function DashboardPage() {
                           <td className="px-2 py-2">
                             <Link
                               to={`/professores/${s.matricula}`}
+                              state={{ from: "/" }}
                               className="text-brand underline-offset-2 hover:underline"
                             >
                               {s.matricula}

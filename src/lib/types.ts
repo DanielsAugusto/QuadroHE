@@ -14,12 +14,110 @@ export type Professor = {
   nome: string;
   cargo: string | null;
   funcao: string | null;
+  cgm?: string | null;
+  dt_admiss?: string | null;
+  cod_cargo?: string | null;
+  dt_inicio?: string | null;
+  rescisao?: string | null;
+  escola?: string | null;
+  tipohora?: string | null;
+  cod_lotacao?: string | null;
+  lotacao?: string | null;
+  padrao?: string | null;
+  observacao?: string | null;
+  raca?: string | null;
+  sexo?: string | null;
+  /** Snapshot completo da linha importada (opcional). */
+  extras?: Record<string, string | number> | string | null;
 };
 
 export type Escola = {
   id: string;
   nome: string;
   em_carencias?: number | boolean;
+};
+
+export type EscolaLotacao = {
+  nome: string;
+  total: number;
+  hora_extra: number;
+  normal: number;
+};
+
+export type LotacaoContagemItem = {
+  nome: string;
+  total: number;
+  hora_extra: number;
+  normal: number;
+};
+
+export type LotacaoContagens = {
+  escola: string;
+  cargos: LotacaoContagemItem[];
+  funcoes: LotacaoContagemItem[];
+};
+
+export type LotacaoContagensGeral = {
+  total: number;
+  normal: number;
+  hora_extra: number;
+  unicas?: boolean;
+  escolas: Array<{
+    nome: string;
+    total: number;
+    normal: number;
+    hora_extra: number;
+    cargos: LotacaoContagemItem[];
+    funcoes: LotacaoContagemItem[];
+  }>;
+};
+
+export type CarenciaContagemEscola = {
+  escola_id: string;
+  escola_nome: string;
+  abertos: number;
+};
+
+export type CarenciaContagemDisciplinaItem = {
+  disciplina_id: string;
+  codigo: string;
+  nome: string;
+  abertos: number;
+};
+
+export type CarenciaContagemDisciplina = {
+  disciplina_id: string;
+  codigo: string;
+  nome: string;
+  abertos: number;
+  escolas: CarenciaContagemEscola[];
+};
+
+export type CarenciaContagemPorEscola = {
+  escola_id: string;
+  escola_nome: string;
+  abertos: number;
+  disciplinas: CarenciaContagemDisciplinaItem[];
+};
+
+export type CarenciaContagens = {
+  total_abertos: number;
+  disciplinas: CarenciaContagemDisciplina[];
+  escolas: CarenciaContagemPorEscola[];
+};
+
+export type FuncionarioLotacao = {
+  id?: string;
+  matricula: string;
+  nome: string;
+  cargo: string | null;
+  funcao: string | null;
+  tipohora: string | null;
+  lotacao: string | null;
+  padrao: string | null;
+  observacao: string | null;
+  dt_admiss: string | null;
+  dt_inicio: string | null;
 };
 
 export type Disciplina = {
@@ -78,6 +176,7 @@ export type Quadro = {
     dia: number;
     periodo: number;
     matricula: string | null;
+    tipo?: TipoCarencia | null;
   }>;
 };
 

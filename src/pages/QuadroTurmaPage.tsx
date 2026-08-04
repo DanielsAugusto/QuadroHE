@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   ErrorBanner,
@@ -37,9 +37,19 @@ function carenciaExpirada(slot: QuadroSlot) {
   );
 }
 
-type QuadroData = { quadro: Quadro; slots: QuadroSlot[] };
+type GrupoItem = { quadro: Quadro; slots: QuadroSlot[] };
+type QuadroData = {
+  quadro: Quadro;
+  slots: QuadroSlot[];
+  grupo?: GrupoItem[];
+};
 
 type CellPos = { dia: number; periodo: number };
+
+type SlotNaGrade = QuadroSlot & {
+  turma_codigo: string;
+  quadro_id: string;
+};
 
 function posKey(p: CellPos) {
   return `${p.dia}:${p.periodo}`;
@@ -70,11 +80,16 @@ export function QuadroTurmaPage() {
   const [professores, setProfessores] = useState<Professor[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [professorSel, setProfessorSel] = useState("");
+  const [buscaProfessor, setBuscaProfessor] = useState("");
+  const [openProfSelect, setOpenProfSelect] = useState(false);
+  const profSelectRef = useRef<HTMLDivElement>(null);
+  const profListId = useId();
   const [tipoCarencia, setTipoCarencia] = useState<TipoCarencia>("REAL");
   const [expiraEm, setExpiraEm] = useState("");
   const [selecao, setSelecao] = useState<Set<string>>(new Set());
   const [ancora, setAncora] = useState<CellPos | null>(null);
   const [saving, setSaving] = useState(false);
+  const [turmaAtivaId, setTurmaAtivaId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!quadroId) return;
@@ -85,6 +100,13 @@ export function QuadroTurmaPage() {
       ]);
       setData(quadro);
       setProfessores(profs);
+      setTurmaAtivaId((prev) => {
+        const ids = (quadro.grupo ?? [{ quadro: quadro.quadro, slots: [] }]).map(
+          (g) => g.quadro.id,
+        );
+        if (prev && ids.includes(prev)) return prev;
+        return quadro.quadro.id;
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Erro ao carregar");
     }
@@ -94,22 +116,54 @@ export function QuadroTurmaPage() {
     void load();
   }, [load]);
 
-  const slotMap = useMemo(() => {
-    const map = new Map<string, QuadroSlot>();
-    for (const s of data?.slots ?? []) {
-      map.set(posKey({ dia: s.dia, periodo: s.periodo }), s);
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      if (!profSelectRef.current?.contains(e.target as Node)) {
+        setOpenProfSelect(false);
+        setBuscaProfessor("");
+      }
     }
-    return map;
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, []);
+
+  const grupo = useMemo((): GrupoItem[] => {
+    if (!data) return [];
+    if (data.grupo && data.grupo.length > 0) return data.grupo;
+    return [{ quadro: data.quadro, slots: data.slots }];
   }, [data]);
 
+  const turmaAtiva = useMemo(
+    () => grupo.find((g) => g.quadro.id === turmaAtivaId) ?? grupo[0] ?? null,
+    [grupo, turmaAtivaId],
+  );
+
+  const slotMap = useMemo(() => {
+    const map = new Map<string, SlotNaGrade>();
+    for (const g of grupo) {
+      for (const s of g.slots) {
+        map.set(posKey({ dia: s.dia, periodo: s.periodo }), {
+          ...s,
+          turma_codigo: g.quadro.turma_codigo,
+          quadro_id: g.quadro.id,
+        });
+      }
+    }
+    return map;
+  }, [grupo]);
+
+  const todosSlots = useMemo(
+    () => [...slotMap.values()],
+    [slotMap],
+  );
+
   const totais = useMemo(() => {
-    const slots = data?.slots ?? [];
     return {
-      total: slots.length,
-      abertos: slots.filter((s) => !s.matricula).length,
-      cobertos: slots.filter((s) => !!s.matricula).length,
+      total: todosSlots.length,
+      abertos: todosSlots.filter((s) => !s.matricula).length,
+      cobertos: todosSlots.filter((s) => !!s.matricula).length,
     };
-  }, [data]);
+  }, [todosSlots]);
 
   function limparSelecao() {
     setSelecao(new Set());
@@ -131,12 +185,43 @@ export function QuadroTurmaPage() {
   async function setSlotsAtivos(ativo: boolean) {
     const cells = [...selecao].map(parseKey);
     if (cells.length === 0) return;
+    if (ativo && !turmaAtiva) {
+      setError("Selecione a turma da carência.");
+      return;
+    }
+
     setSaving(true);
     setError(null);
     try {
       const extra = payloadCarencia(ativo);
+      const alvoId = turmaAtiva!.quadro.id;
+
       for (const c of cells) {
-        await api(`/quadros/${quadroId}/slots`, {
+        const key = posKey(c);
+        const atual = slotMap.get(key);
+
+        if (!ativo) {
+          if (!atual) continue;
+          await api(`/quadros/${atual.quadro_id}/slots`, {
+            method: "PUT",
+            body: JSON.stringify({ dia: c.dia, periodo: c.periodo, ativo: false }),
+          });
+          continue;
+        }
+
+        // Se já existe em outra turma do grupo, remove de lá antes de marcar
+        if (atual && atual.quadro_id !== alvoId) {
+          await api(`/quadros/${atual.quadro_id}/slots`, {
+            method: "PUT",
+            body: JSON.stringify({
+              dia: c.dia,
+              periodo: c.periodo,
+              ativo: false,
+            }),
+          });
+        }
+
+        await api(`/quadros/${alvoId}/slots`, {
           method: "PUT",
           body: JSON.stringify({ dia: c.dia, periodo: c.periodo, ...extra }),
         });
@@ -151,7 +236,11 @@ export function QuadroTurmaPage() {
   }
 
   async function atribuirProfessor() {
-    if (!quadroId || !professorSel) {
+    if (!turmaAtiva) {
+      setError("Selecione a turma.");
+      return;
+    }
+    if (!professorSel) {
       setError("Selecione um professor no menu.");
       return;
     }
@@ -162,30 +251,45 @@ export function QuadroTurmaPage() {
     setError(null);
     try {
       const extra = payloadCarencia(true);
-      // Garante carência nas células selecionadas
+      const alvoId = turmaAtiva.quadro.id;
+
       for (const c of cells) {
-        await api(`/quadros/${quadroId}/slots`, {
+        const key = posKey(c);
+        const atual = slotMap.get(key);
+        if (atual && atual.quadro_id !== alvoId) {
+          await api(`/quadros/${atual.quadro_id}/slots`, {
+            method: "PUT",
+            body: JSON.stringify({
+              dia: c.dia,
+              periodo: c.periodo,
+              ativo: false,
+            }),
+          });
+        }
+        await api(`/quadros/${alvoId}/slots`, {
           method: "PUT",
           body: JSON.stringify({ dia: c.dia, periodo: c.periodo, ...extra }),
         });
       }
-      // Recarrega para pegar IDs dos slots
-      const atualizado = await api<QuadroData>(`/quadros/${quadroId}`);
-      const map = new Map(
-        atualizado.slots.map((s) => [
-          posKey({ dia: s.dia, periodo: s.periodo }),
-          s.id,
-        ]),
-      );
+
+      const atualizado = await api<QuadroData>(`/quadros/${alvoId}`);
+      const mapGrupo = new Map<string, string>();
+      for (const g of atualizado.grupo ?? [
+        { quadro: atualizado.quadro, slots: atualizado.slots },
+      ]) {
+        if (g.quadro.id !== alvoId) continue;
+        for (const s of g.slots) {
+          mapGrupo.set(posKey({ dia: s.dia, periodo: s.periodo }), s.id);
+        }
+      }
       const ids = cells
-        .map((c) => map.get(posKey(c)))
+        .map((c) => mapGrupo.get(posKey(c)))
         .filter((id): id is string => !!id);
 
-      await api(`/quadros/${quadroId}/atribuir`, {
+      await api(`/quadros/${alvoId}/atribuir`, {
         method: "POST",
         body: JSON.stringify({ matricula: professorSel, slot_ids: ids }),
       });
-      setData(atualizado);
       await load();
       limparSelecao();
     } catch (err) {
@@ -198,7 +302,7 @@ export function QuadroTurmaPage() {
   async function removerProfessor() {
     const ids = [...selecao]
       .map((k) => slotMap.get(k))
-      .filter((s): s is QuadroSlot => !!s && !!s.matricula)
+      .filter((s): s is SlotNaGrade => !!s && !!s.matricula)
       .map((s) => s.id);
 
     if (ids.length === 0) {
@@ -231,26 +335,12 @@ export function QuadroTurmaPage() {
 
     if (e.shiftKey && ancora) {
       const keys = rangeKeys(ancora, pos);
-      setSelecao((prev) => {
-        if (e.ctrlKey || e.metaKey) {
-          const next = new Set(prev);
-          for (const k of keys) next.add(k);
-          return next;
-        }
-        return new Set(keys);
-      });
+      setSelecao(new Set(keys));
       return;
     }
 
-    // Clique / Ctrl: alterna seleção
     setSelecao((prev) => {
-      const next = e.ctrlKey || e.metaKey ? new Set(prev) : new Set<string>();
-      // Sem Ctrl: começa nova seleção com esta célula (ou desmarca se era a única)
-      if (!e.ctrlKey && !e.metaKey) {
-        if (prev.size === 1 && prev.has(key)) return new Set();
-        next.add(key);
-        return next;
-      }
+      const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
       return next;
@@ -259,10 +349,10 @@ export function QuadroTurmaPage() {
   }
 
   async function salvarObs(texto: string) {
-    if (!quadroId) return;
+    if (!turmaAtiva) return;
     setSaving(true);
     try {
-      await api(`/quadros/${quadroId}/observacao`, {
+      await api(`/quadros/${turmaAtiva.quadro.id}/observacao`, {
         method: "PUT",
         body: JSON.stringify({ observacao: texto }),
       });
@@ -278,7 +368,7 @@ export function QuadroTurmaPage() {
     return <p className="text-sm text-muted">Carregando quadro...</p>;
   }
 
-  if (!data) {
+  if (!data || !turmaAtiva) {
     return (
       <div>
         <ErrorBanner message={error} />
@@ -294,9 +384,24 @@ export function QuadroTurmaPage() {
   const professorNome =
     professores.find((p) => p.matricula === professorSel)?.nome ?? "";
 
+  const qProf = buscaProfessor.trim().toLowerCase();
+  const professoresFiltrados = qProf
+    ? professores.filter(
+        (p) =>
+          p.nome.toLowerCase().includes(qProf) ||
+          p.matricula.toLowerCase().includes(qProf),
+      )
+    : professores;
+
+  function escolherProfessor(matricula: string) {
+    setProfessorSel(matricula);
+    setBuscaProfessor("");
+    setOpenProfSelect(false);
+  }
+
   const professoresNoQuadro = [
     ...new Map(
-      data.slots
+      todosSlots
         .filter((s) => s.matricula)
         .map((s) => [
           s.matricula!,
@@ -305,13 +410,18 @@ export function QuadroTurmaPage() {
     ).values(),
   ];
 
+  const tituloTurmas =
+    grupo.length === 1
+      ? `Turma ${grupo[0]!.quadro.turma_codigo}`
+      : `${grupo.length} turmas · ${TURNO_LABEL[turno]}`;
+
   return (
     <div className="pb-40">
       <PageHeader
-        title={`Turma ${q.turma_codigo}`}
+        title={tituloTurmas}
         description={`${q.escola_nome} · ${TURNO_LABEL[turno]}${
           q.disciplina_codigo ? ` · ${q.disciplina_codigo}` : ""
-        }. Selecione os horários e depois escolha a ação no menu.`}
+        }. Selecione os horários, escolha a turma e a ação no menu.`}
         actions={
           <Link to={`/carencias/${escolaId}`} className={btnSecondary}>
             Voltar às turmas
@@ -342,20 +452,20 @@ export function QuadroTurmaPage() {
           </div>
           <div className="flex flex-wrap items-center gap-3 self-center text-xs text-muted">
             <span className="inline-flex items-center gap-1.5">
-              <span className="h-3 w-3 rounded-sm bg-sky-50 ring-1 ring-border" />
-              Real
+              <span className="h-3 w-3 rounded-sm bg-sky-200 ring-1 ring-sky-300" />
+              Real em aberto
             </span>
             <span className="inline-flex items-center gap-1.5">
-              <span className="h-3 w-3 rounded-sm bg-amber-100 ring-1 ring-amber-200" />
-              Temporária
+              <span className="h-3 w-3 rounded-sm bg-rose-200 ring-1 ring-rose-300" />
+              Temporária em aberto
             </span>
             <span className="inline-flex items-center gap-1.5">
-              <span className="h-3 w-3 rounded-sm bg-rose-100 ring-1 ring-rose-200" />
-              Expirada
+              <span className="h-3 w-3 rounded-sm bg-orange-200 ring-1 ring-orange-300" />
+              Temporária com professor
             </span>
             <span className="inline-flex items-center gap-1.5">
-              <span className="h-3 w-3 rounded-sm bg-emerald-100 ring-1 ring-emerald-200" />
-              Com professor
+              <span className="h-3 w-3 rounded-sm bg-emerald-200 ring-1 ring-emerald-300" />
+              Real com professor
             </span>
           </div>
         </div>
@@ -366,18 +476,22 @@ export function QuadroTurmaPage() {
           <div
             className={`rounded-t-lg px-4 py-2 text-center text-sm font-bold tracking-wide ${TURNO_HEADER[turno]}`}
           >
-            {q.turma_codigo} — {TURNO_LABEL[turno].toUpperCase()}
+            {grupo.map((g) => g.quadro.turma_codigo).join(" · ")} —{" "}
+            {TURNO_LABEL[turno].toUpperCase()}
+            {q.disciplina_codigo ? ` · ${q.disciplina_codigo}` : ""}
           </div>
 
           <div className="border-b border-amber-200 bg-amber-50 px-3 py-2">
             <input
               className="w-full bg-transparent text-xs text-danger outline-none placeholder:text-muted"
-              placeholder="Observação (ex.: L. MÉDICA...)"
-              defaultValue={q.observacao ?? ""}
-              key={q.observacao ?? ""}
+              placeholder={`Observação da turma ${turmaAtiva.quadro.turma_codigo} (ex.: L. MÉDICA...)`}
+              defaultValue={turmaAtiva.quadro.observacao ?? ""}
+              key={`${turmaAtiva.quadro.id}-${turmaAtiva.quadro.observacao ?? ""}`}
               onBlur={(e) => {
                 const next = e.target.value.trim();
-                if (next !== (q.observacao ?? "")) void salvarObs(next);
+                if (next !== (turmaAtiva.quadro.observacao ?? "")) {
+                  void salvarObs(next);
+                }
               }}
             />
           </div>
@@ -410,24 +524,28 @@ export function QuadroTurmaPage() {
                     const temporaria = slot?.tipo === "TEMPORARIA";
                     const expirada = slot ? carenciaExpirada(slot) : false;
 
-                    let cellClass =
-                      "bg-white text-muted";
+                    let cellClass = "bg-white text-muted";
                     if (selecionada) {
                       cellClass =
                         "bg-brand text-white ring-2 ring-inset ring-brand-dark";
-                    } else if (expirada) {
-                      cellClass = "bg-rose-100 text-rose-900";
-                    } else if (coberta) {
-                      cellClass = "bg-emerald-100 text-brand-dark";
-                    } else if (temporaria) {
-                      cellClass = "bg-amber-100 text-amber-950";
                     } else if (slot) {
-                      cellClass = "bg-sky-50 text-foreground";
+                      if (coberta && temporaria) {
+                        cellClass = "bg-orange-200 text-orange-950";
+                      } else if (coberta) {
+                        cellClass = "bg-emerald-200 text-emerald-950";
+                      } else if (temporaria) {
+                        cellClass = "bg-rose-200 text-rose-950";
+                      } else {
+                        cellClass = "bg-sky-200 text-sky-950";
+                      }
                     }
 
                     const tituloParts = [
-                      "Clique = selecionar · Ctrl = somar · Shift = intervalo",
+                      "Clique = somar/tirar · Shift = intervalo",
                     ];
+                    if (slot?.turma_codigo) {
+                      tituloParts.push(`Turma ${slot.turma_codigo}`);
+                    }
                     if (slot?.tipo) {
                       tituloParts.push(
                         `Carência ${TIPO_CARENCIA_LABEL[slot.tipo]}`,
@@ -446,7 +564,7 @@ export function QuadroTurmaPage() {
                         <button
                           type="button"
                           onMouseDown={(e) => {
-                            if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                            if (e.shiftKey) {
                               e.preventDefault();
                             }
                           }}
@@ -454,7 +572,7 @@ export function QuadroTurmaPage() {
                           className={`flex h-14 w-full flex-col items-center justify-center gap-0.5 px-1 font-medium transition hover:brightness-95 ${cellClass}`}
                           title={tituloParts.join(" · ")}
                         >
-                          <span>{slot ? q.turma_codigo : "·"}</span>
+                          <span>{slot ? slot.turma_codigo : "·"}</span>
                           {coberta && slot?.professor_nome ? (
                             <span className="max-w-full truncate text-[10px] font-normal opacity-80">
                               {slot.professor_nome.split(" ")[0]}
@@ -481,13 +599,16 @@ export function QuadroTurmaPage() {
             ) : (
               <div className="space-y-1">
                 {professoresNoQuadro.map((p) => {
-                  const qtd = data.slots.filter(
+                  const qtd = todosSlots.filter(
                     (s) => s.matricula === p.matricula,
                   ).length;
                   return (
                     <div key={p.matricula} className="flex flex-wrap gap-2">
                       <Link
                         to={`/professores/${p.matricula}`}
+                        state={{
+                          from: `/carencias/${escolaId}/${quadroId}`,
+                        }}
                         className="font-medium text-brand underline-offset-2 hover:underline"
                       >
                         {p.nome} ({p.matricula})
@@ -514,7 +635,7 @@ export function QuadroTurmaPage() {
                   Nenhuma célula selecionada
                 </p>
                 <p className="text-xs text-muted">
-                  Clique na grade · Ctrl soma · Shift marca intervalo
+                  Clique na grade para somar · Shift marca intervalo
                 </p>
               </div>
             </div>
@@ -534,7 +655,7 @@ export function QuadroTurmaPage() {
                       <p className="mt-1 text-xs text-muted">Salvando…</p>
                     ) : (
                       <p className="mt-1 text-xs text-muted">
-                        Defina o tipo e a ação
+                        Escolha a turma e a ação
                       </p>
                     )}
                   </div>
@@ -553,6 +674,38 @@ export function QuadroTurmaPage() {
                   <p className="mb-2 px-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted">
                     Carência
                   </p>
+
+                  <div className="mb-2.5 flex flex-wrap gap-1.5 px-0.5">
+                    {grupo.map((g) => {
+                      const ativa = g.quadro.id === turmaAtiva.quadro.id;
+                      const abertos = g.slots.filter((s) => !s.matricula).length;
+                      return (
+                        <button
+                          key={g.quadro.id}
+                          type="button"
+                          onClick={() => setTurmaAtivaId(g.quadro.id)}
+                          className={`min-w-[3.25rem] rounded-lg border px-2.5 py-1.5 text-left transition ${
+                            ativa
+                              ? "border-brand bg-brand text-white shadow-sm"
+                              : "border-border bg-white text-foreground hover:border-brand/40 hover:bg-brand-soft/40"
+                          }`}
+                          title={`Turma ${g.quadro.turma_codigo}`}
+                        >
+                          <span className="block text-sm font-semibold leading-none">
+                            {g.quadro.turma_codigo}
+                          </span>
+                          <span
+                            className={`mt-0.5 block text-[10px] ${
+                              ativa ? "text-white/80" : "text-muted"
+                            }`}
+                          >
+                            {abertos} aberto{abertos === 1 ? "" : "s"}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
                   <div className="flex flex-wrap items-center gap-2">
                     <div className="inline-flex rounded-lg bg-background p-0.5 ring-1 ring-border">
                       {(
@@ -597,7 +750,7 @@ export function QuadroTurmaPage() {
                         }
                         onClick={() => void setSlotsAtivos(true)}
                       >
-                        Marcar
+                        Marcar · {turmaAtiva.quadro.turma_codigo}
                       </button>
                       <button
                         type="button"
@@ -616,19 +769,87 @@ export function QuadroTurmaPage() {
                     Professor
                   </p>
                   <div className="flex flex-wrap items-center gap-2">
-                    <select
-                      aria-label="Professor"
-                      className="h-8 min-w-[160px] flex-1 rounded-lg border border-border bg-white px-2.5 text-xs text-foreground outline-none focus:ring-2 focus:ring-brand/30"
-                      value={professorSel}
-                      onChange={(e) => setProfessorSel(e.target.value)}
-                    >
-                      <option value="">Selecione…</option>
-                      {professores.map((p) => (
-                        <option key={p.matricula} value={p.matricula}>
-                          {p.nome} ({p.matricula})
-                        </option>
-                      ))}
-                    </select>
+                    <div className="relative min-w-[160px] flex-1" ref={profSelectRef}>
+                      <input
+                        aria-label="Professor"
+                        role="combobox"
+                        aria-expanded={openProfSelect}
+                        aria-controls={profListId}
+                        aria-autocomplete="list"
+                        className="h-8 w-full rounded-lg border border-border bg-white px-2.5 text-xs text-foreground outline-none focus:ring-2 focus:ring-brand/30"
+                        placeholder={
+                          professorSel
+                            ? `${professorNome} (${professorSel})`
+                            : "Buscar nome ou matrícula…"
+                        }
+                        value={
+                          openProfSelect || buscaProfessor ? buscaProfessor : ""
+                        }
+                        onFocus={() => setOpenProfSelect(true)}
+                        onChange={(e) => {
+                          setBuscaProfessor(e.target.value);
+                          setOpenProfSelect(true);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") {
+                            setOpenProfSelect(false);
+                            setBuscaProfessor("");
+                          }
+                          if (e.key === "Enter" && professoresFiltrados[0]) {
+                            e.preventDefault();
+                            escolherProfessor(professoresFiltrados[0].matricula);
+                          }
+                          if (e.key === "Backspace" && !buscaProfessor && professorSel) {
+                            setProfessorSel("");
+                          }
+                        }}
+                      />
+                      {openProfSelect ? (
+                        <ul
+                          id={profListId}
+                          role="listbox"
+                          className="absolute bottom-full z-30 mb-1 max-h-56 w-full overflow-y-auto rounded-md border border-border bg-surface shadow-lg"
+                        >
+                          {professoresFiltrados.length === 0 ? (
+                            <li className="px-3 py-2 text-xs text-muted">
+                              Nenhum professor encontrado.
+                            </li>
+                          ) : (
+                            professoresFiltrados.slice(0, 80).map((p) => {
+                              const active = p.matricula === professorSel;
+                              return (
+                                <li
+                                  key={p.matricula}
+                                  role="option"
+                                  aria-selected={active}
+                                >
+                                  <button
+                                    type="button"
+                                    className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-xs transition ${
+                                      active
+                                        ? "bg-brand-soft/50"
+                                        : "hover:bg-brand-soft/25"
+                                    }`}
+                                    onMouseDown={(ev) => ev.preventDefault()}
+                                    onClick={() =>
+                                      escolherProfessor(p.matricula)
+                                    }
+                                  >
+                                    <span className="font-medium leading-snug">
+                                      {p.nome}
+                                    </span>
+                                    <span className="text-[10px] text-muted">
+                                      {p.matricula}
+                                      {p.cargo ? ` · ${p.cargo}` : ""}
+                                    </span>
+                                  </button>
+                                </li>
+                              );
+                            })
+                          )}
+                        </ul>
+                      ) : null}
+                    </div>
                     <button
                       type="button"
                       className="h-8 rounded-lg bg-brand px-3 text-xs font-semibold text-white transition hover:bg-brand-dark disabled:opacity-45"

@@ -3,14 +3,14 @@ import { AppNav } from "@/components/AppNav";
 import { useAuth } from "@/lib/auth";
 import { LoginPage } from "@/pages/LoginPage";
 import { DashboardPage } from "@/pages/DashboardPage";
-import { ProfessoresPage } from "@/pages/ProfessoresPage";
 import { FichaProfessorPage } from "@/pages/FichaProfessorPage";
-import { EscolasPage } from "@/pages/EscolasPage";
-import { DisciplinasPage } from "@/pages/DisciplinasPage";
+import { ConfiguracaoPage } from "@/pages/ConfiguracaoPage";
 import { HoraExtraPage } from "@/pages/HoraExtraPage";
 import { AlocacoesPage } from "@/pages/AlocacoesPage";
 import { CarenciasPage } from "@/pages/CarenciasPage";
+import { ContagensPage } from "@/pages/ContagensPage";
 import { EscolaQuadrosPage } from "@/pages/EscolaQuadrosPage";
+import { EscolasLotacaoPage } from "@/pages/EscolasLotacaoPage";
 import { QuadroTurmaPage } from "@/pages/QuadroTurmaPage";
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -26,7 +26,7 @@ function Protected({ children }: { children: React.ReactNode }) {
   return (
     <div className="min-h-screen lg:flex">
       <AppNav />
-      <main className="flex-1 px-4 py-6 sm:px-6 lg:px-8">{children}</main>
+      <main className="min-w-0 flex-1 overflow-x-hidden px-4 py-6 sm:px-6 lg:px-8">{children}</main>
     </div>
   );
 }
@@ -45,11 +45,7 @@ export default function App() {
       />
       <Route
         path="/professores"
-        element={
-          <Protected>
-            <ProfessoresPage />
-          </Protected>
-        }
+        element={<Navigate to="/configuracao?tab=professores" replace />}
       />
       <Route
         path="/professores/:matricula"
@@ -60,20 +56,24 @@ export default function App() {
         }
       />
       <Route
+        path="/configuracao"
+        element={
+          <Protected>
+            <ConfiguracaoPage />
+          </Protected>
+        }
+      />
+      <Route
         path="/escolas"
         element={
           <Protected>
-            <EscolasPage />
+            <EscolasLotacaoPage />
           </Protected>
         }
       />
       <Route
         path="/disciplinas"
-        element={
-          <Protected>
-            <DisciplinasPage />
-          </Protected>
-        }
+        element={<Navigate to="/configuracao?tab=disciplinas" replace />}
       />
       <Route
         path="/hora-extra"
@@ -96,6 +96,14 @@ export default function App() {
         element={
           <Protected>
             <CarenciasPage />
+          </Protected>
+        }
+      />
+      <Route
+        path="/contagens"
+        element={
+          <Protected>
+            <ContagensPage />
           </Protected>
         }
       />

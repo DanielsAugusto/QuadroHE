@@ -3,6 +3,7 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useId,
   useRef,
   useState,
 } from "react";
@@ -24,6 +25,7 @@ import {
   inputClass,
 } from "@/components/ui";
 import { api } from "@/lib/api";
+import { decodeSpreadsheetText } from "@/lib/textEncoding";
 import {
   TIPO_HE_LABEL,
   formatDateBR,
@@ -172,8 +174,27 @@ function parseTipoHe(value: unknown): string {
   return "REAL";
 }
 
-function parseHoraExtraExcel(buffer: ArrayBuffer) {
-  const wb = XLSX.read(buffer, { type: "array", cellDates: true });
+function parseHoraExtraExcel(buffer: ArrayBuffer, fileName?: string) {
+  const isCsv =
+    fileName?.toLowerCase().endsWith(".csv") ||
+    (() => {
+      const head = decodeSpreadsheetText(buffer.slice(0, 120));
+      return head.includes(";") && !head.includes("PK");
+    })();
+
+  let wb: XLSX.WorkBook;
+  if (isCsv) {
+    const text = decodeSpreadsheetText(buffer);
+    const first = text.split(/\r?\n/)[0] ?? "";
+    const FS =
+      (first.match(/;/g) ?? []).length >= (first.match(/,/g) ?? []).length
+        ? ";"
+        : ",";
+    wb = XLSX.read(text, { type: "string", FS, cellDates: true });
+  } else {
+    wb = XLSX.read(buffer, { type: "array", cellDates: true });
+  }
+
   const sheet = wb.Sheets[wb.SheetNames[0]];
   if (!sheet) throw new Error("Planilha vazia");
 
@@ -184,6 +205,25 @@ function parseHoraExtraExcel(buffer: ArrayBuffer) {
 
   if (rawRows.length === 0) {
     throw new Error("Nenhuma linha encontrada na planilha");
+  }
+
+  const headerKeys = Object.keys(rawRows[0] ?? {}).map((k) =>
+    normalizeHeader(k),
+  );
+  const pareceLotacaoProf =
+    headerKeys.some((k) => k.includes("TIPOHORA") || k === "TIPO_HORA") &&
+    headerKeys.some((k) => k === "ESCOLA" || k.includes("LOTAC")) &&
+    !headerKeys.some(
+      (k) =>
+        k.includes("N_TEMPOS") ||
+        k === "TEMPOS" ||
+        k.includes("TEMPOS_HORAS") ||
+        k.includes("OF_MEMO"),
+    );
+  if (pareceLotacaoProf) {
+    throw new Error(
+      "Este arquivo é o relatório de lotação de professores (tipohora/escola), não o de Hora Extra. Importe em Configuração → Professores.",
+    );
   }
 
   const parsed = rawRows.map((row) => {
@@ -269,6 +309,7 @@ export function HoraExtraPage() {
   const [itens, setItens] = useState<HoraExtra[]>([]);
   const [total, setTotal] = useState(0);
   const [professores, setProfessores] = useState<Professor[]>([]);
+  const [lotacoesOpcoes, setLotacoesOpcoes] = useState<string[]>([]);
   const [form, setForm] = useState(emptyForm);
   const [editing, setEditing] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
@@ -282,11 +323,24 @@ export function HoraExtraPage() {
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
   const [busca, setBusca] = useState("");
   const [page, setPage] = useState(1);
+  const [buscaProfessor, setBuscaProfessor] = useState("");
+  const [openProfSelect, setOpenProfSelect] = useState(false);
+  const [buscaLotacao, setBuscaLotacao] = useState("");
+  const [openLotacaoSelect, setOpenLotacaoSelect] = useState(false);
+  const profSelectRef = useRef<HTMLDivElement>(null);
+  const lotacaoSelectRef = useRef<HTMLDivElement>(null);
+  const profListId = useId();
+  const lotacaoListId = useId();
   const fileRef = useRef<HTMLInputElement>(null);
   const buscaDeferred = useDeferredValue(busca);
 
   const loadLookups = useCallback(async () => {
-    setProfessores(await api<Professor[]>("/professores"));
+    const [profs, lotacoes] = await Promise.all([
+      api<Professor[]>("/professores"),
+      api<string[]>("/lotacao/opcoes"),
+    ]);
+    setProfessores(profs);
+    setLotacoesOpcoes(lotacoes);
   }, []);
 
   const load = useCallback(async () => {
@@ -323,21 +377,61 @@ export function HoraExtraPage() {
   const inicio = total === 0 ? 0 : (pageSafe - 1) * PAGE_SIZE + 1;
   const fim = Math.min(pageSafe * PAGE_SIZE, total);
 
-  function preencherProfessor(matricula: string) {
-    const p = professores.find((x) => x.matricula === matricula.trim());
-    if (!p) return;
+  function escolherProfessor(p: Professor) {
     setForm((f) => ({
       ...f,
       matricula: p.matricula,
       nome: p.nome,
       cargo: p.cargo ?? "",
       funcao: p.funcao ?? "",
+      lotacao_origem: p.lotacao?.trim() || f.lotacao_origem,
     }));
+    setBuscaProfessor("");
+    setOpenProfSelect(false);
   }
+
+  function escolherLotacao(nome: string) {
+    setForm((f) => ({ ...f, lotacao_origem: nome }));
+    setBuscaLotacao("");
+    setOpenLotacaoSelect(false);
+  }
+
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      if (!profSelectRef.current?.contains(e.target as Node)) {
+        setOpenProfSelect(false);
+        setBuscaProfessor("");
+      }
+      if (!lotacaoSelectRef.current?.contains(e.target as Node)) {
+        setOpenLotacaoSelect(false);
+        setBuscaLotacao("");
+      }
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, []);
+
+  const qProf = buscaProfessor.trim().toLowerCase();
+  const professoresFiltrados = qProf
+    ? professores.filter(
+        (p) =>
+          p.nome.toLowerCase().includes(qProf) ||
+          p.matricula.toLowerCase().includes(qProf),
+      )
+    : professores;
+
+  const qLot = buscaLotacao.trim().toLowerCase();
+  const lotacoesFiltradas = qLot
+    ? lotacoesOpcoes.filter((l) => l.toLowerCase().includes(qLot))
+    : lotacoesOpcoes;
 
   function abrirNova() {
     setEditing(null);
     setForm(emptyForm);
+    setBuscaProfessor("");
+    setOpenProfSelect(false);
+    setBuscaLotacao("");
+    setOpenLotacaoSelect(false);
     setFormError(null);
     setModalOpen(true);
   }
@@ -345,6 +439,10 @@ export function HoraExtraPage() {
   function abrirEditar(h: HoraExtra) {
     const p = professores.find((x) => x.matricula === h.matricula);
     setEditing(h.id);
+    setBuscaProfessor("");
+    setOpenProfSelect(false);
+    setBuscaLotacao("");
+    setOpenLotacaoSelect(false);
     setForm({
       matricula: h.matricula,
       nome: h.professor_nome || p?.nome || "",
@@ -367,6 +465,10 @@ export function HoraExtraPage() {
     setModalOpen(false);
     setEditing(null);
     setForm(emptyForm);
+    setBuscaProfessor("");
+    setOpenProfSelect(false);
+    setBuscaLotacao("");
+    setOpenLotacaoSelect(false);
     setFormError(null);
   }
 
@@ -445,7 +547,7 @@ export function HoraExtraPage() {
     setError(null);
     try {
       const buffer = await file.arrayBuffer();
-      const itensImport = parseHoraExtraExcel(buffer);
+      const itensImport = parseHoraExtraExcel(buffer, file.name);
       const result = await api<ImportResult>("/horas-extra/import", {
         method: "POST",
         body: JSON.stringify({ itens: itensImport }),
@@ -554,6 +656,7 @@ export function HoraExtraPage() {
                       <td className="px-2 py-2">
                         <Link
                           to={`/professores/${h.matricula}`}
+                          state={{ from: "/hora-extra" }}
                           className="text-brand underline-offset-2 hover:underline"
                         >
                           {h.professor_nome ?? h.matricula}
@@ -621,26 +724,104 @@ export function HoraExtraPage() {
       >
         <ErrorBanner message={formError} />
         <form onSubmit={onSubmit} className="space-y-3">
+          <Field label="Professor">
+            <div className="relative" ref={profSelectRef}>
+              <input
+                className={inputClass}
+                role="combobox"
+                aria-expanded={openProfSelect}
+                aria-controls={profListId}
+                aria-autocomplete="list"
+                autoFocus
+                placeholder={
+                  form.matricula
+                    ? `${form.nome} (${form.matricula})`
+                    : "Buscar nome ou matrícula…"
+                }
+                value={openProfSelect || buscaProfessor ? buscaProfessor : ""}
+                onFocus={() => setOpenProfSelect(true)}
+                onChange={(e) => {
+                  setBuscaProfessor(e.target.value);
+                  setOpenProfSelect(true);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    setOpenProfSelect(false);
+                    setBuscaProfessor("");
+                  }
+                  if (e.key === "Enter" && professoresFiltrados[0]) {
+                    e.preventDefault();
+                    escolherProfessor(professoresFiltrados[0]);
+                  }
+                  if (
+                    e.key === "Backspace" &&
+                    !buscaProfessor &&
+                    form.matricula
+                  ) {
+                    setForm((f) => ({
+                      ...f,
+                      matricula: "",
+                      nome: "",
+                      cargo: "",
+                      funcao: "",
+                    }));
+                  }
+                }}
+              />
+              {openProfSelect ? (
+                <ul
+                  id={profListId}
+                  role="listbox"
+                  className="absolute z-30 mt-1 max-h-56 w-full overflow-y-auto rounded-md border border-border bg-surface shadow-lg"
+                >
+                  {professoresFiltrados.length === 0 ? (
+                    <li className="px-3 py-2 text-sm text-muted">
+                      Nenhum professor encontrado.
+                    </li>
+                  ) : (
+                    professoresFiltrados.slice(0, 80).map((p) => {
+                      const active = p.matricula === form.matricula;
+                      return (
+                        <li
+                          key={p.matricula}
+                          role="option"
+                          aria-selected={active}
+                        >
+                          <button
+                            type="button"
+                            className={`flex w-full flex-col gap-0.5 px-3 py-2 text-left text-sm transition ${
+                              active
+                                ? "bg-brand-soft/50"
+                                : "hover:bg-brand-soft/25"
+                            }`}
+                            onMouseDown={(ev) => ev.preventDefault()}
+                            onClick={() => escolherProfessor(p)}
+                          >
+                            <span className="font-medium leading-snug">
+                              {p.nome}
+                            </span>
+                            <span className="text-xs text-muted">
+                              {p.matricula}
+                              {p.cargo ? ` · ${p.cargo}` : ""}
+                              {p.funcao ? ` · ${p.funcao}` : ""}
+                            </span>
+                          </button>
+                        </li>
+                      );
+                    })
+                  )}
+                </ul>
+              ) : null}
+            </div>
+          </Field>
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="Matrícula">
               <input
-                className={inputClass}
+                className={`${inputClass} bg-background`}
                 required
-                autoFocus
-                list="he-matriculas"
+                readOnly
                 value={form.matricula}
-                onChange={(e) =>
-                  setForm((f) => ({ ...f, matricula: e.target.value }))
-                }
-                onBlur={() => preencherProfessor(form.matricula)}
               />
-              <datalist id="he-matriculas">
-                {professores.map((p) => (
-                  <option key={p.matricula} value={p.matricula}>
-                    {p.nome}
-                  </option>
-                ))}
-              </datalist>
             </Field>
             <Field label="Funcionário">
               <input
@@ -674,13 +855,97 @@ export function HoraExtraPage() {
             </Field>
           </div>
           <Field label="Lotação">
-            <input
-              className={inputClass}
-              value={form.lotacao_origem}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, lotacao_origem: e.target.value }))
-              }
-            />
+            <div className="relative" ref={lotacaoSelectRef}>
+              <input
+                className={inputClass}
+                role="combobox"
+                aria-expanded={openLotacaoSelect}
+                aria-controls={lotacaoListId}
+                aria-autocomplete="list"
+                placeholder={
+                  form.lotacao_origem
+                    ? form.lotacao_origem
+                    : "Buscar ou digitar lotação…"
+                }
+                value={openLotacaoSelect ? buscaLotacao : ""}
+                onFocus={() => {
+                  setOpenLotacaoSelect(true);
+                  setBuscaLotacao(form.lotacao_origem);
+                }}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setBuscaLotacao(v);
+                  setForm((f) => ({ ...f, lotacao_origem: v }));
+                  setOpenLotacaoSelect(true);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    setOpenLotacaoSelect(false);
+                    setBuscaLotacao("");
+                  }
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    if (lotacoesFiltradas[0]) {
+                      escolherLotacao(lotacoesFiltradas[0]);
+                    } else if (buscaLotacao.trim()) {
+                      escolherLotacao(buscaLotacao.trim());
+                    }
+                  }
+                }}
+              />
+              {openLotacaoSelect ? (
+                <ul
+                  id={lotacaoListId}
+                  role="listbox"
+                  className="absolute z-30 mt-1 max-h-56 w-full overflow-y-auto rounded-md border border-border bg-surface shadow-lg"
+                >
+                  {buscaLotacao.trim() &&
+                  !lotacoesFiltradas.some(
+                    (l) =>
+                      l.toLowerCase() === buscaLotacao.trim().toLowerCase(),
+                  ) ? (
+                    <li role="option">
+                      <button
+                        type="button"
+                        className="flex w-full flex-col gap-0.5 px-3 py-2 text-left text-sm hover:bg-brand-soft/25"
+                        onMouseDown={(ev) => ev.preventDefault()}
+                        onClick={() => escolherLotacao(buscaLotacao.trim())}
+                      >
+                        <span className="font-medium">
+                          Usar “{buscaLotacao.trim()}”
+                        </span>
+                        <span className="text-xs text-muted">Novo valor</span>
+                      </button>
+                    </li>
+                  ) : null}
+                  {lotacoesFiltradas.length === 0 && !buscaLotacao.trim() ? (
+                    <li className="px-3 py-2 text-sm text-muted">
+                      Nenhuma lotação cadastrada. Digite para criar.
+                    </li>
+                  ) : (
+                    lotacoesFiltradas.slice(0, 80).map((l) => {
+                      const active = l === form.lotacao_origem;
+                      return (
+                        <li key={l} role="option" aria-selected={active}>
+                          <button
+                            type="button"
+                            className={`flex w-full px-3 py-2 text-left text-sm transition ${
+                              active
+                                ? "bg-brand-soft/50 font-medium"
+                                : "hover:bg-brand-soft/25"
+                            }`}
+                            onMouseDown={(ev) => ev.preventDefault()}
+                            onClick={() => escolherLotacao(l)}
+                          >
+                            {l}
+                          </button>
+                        </li>
+                      );
+                    })
+                  )}
+                </ul>
+              ) : null}
+            </div>
           </Field>
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="N° tempos/horas">
