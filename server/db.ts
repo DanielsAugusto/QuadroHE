@@ -36,6 +36,55 @@ function ensureColumn(table: string, column: string, ddl: string) {
 function migrateQuadroSlotsColumns() {
   ensureColumn("quadro_slots", "tipo", "text not null default 'REAL'");
   ensureColumn("quadro_slots", "expira_em", "text");
+  ensureColumn("quadro_slots", "turma_codigo", "text");
+  ensureColumn("quadro_slots", "modalidade_cobertura", "text check (modalidade_cobertura in ('NORMAL', 'HORA_EXTRA'))");
+  ensureColumn("quadro_slots", "titular_matricula", "text");
+  ensureColumn(
+    "quadro_slots",
+    "titular_modalidade",
+    "text check (titular_modalidade in ('NORMAL', 'HORA_EXTRA'))",
+  );
+}
+
+/** Um quadro pode ter várias turmas; slots guardam qual turma está no horário. */
+function migrateQuadrosMultiTurmas() {
+  ensureColumn("quadros", "turmas_json", "text");
+
+  const semJson = db
+    .prepare(
+      `select id, turma_codigo from quadros
+       where turmas_json is null or trim(turmas_json) = ''`,
+    )
+    .all() as Array<{ id: string; turma_codigo: string }>;
+
+  const updQuadro = db.prepare(
+    "update quadros set turmas_json = ? where id = ?",
+  );
+  for (const q of semJson) {
+    const parts = String(q.turma_codigo ?? "")
+      .split("+")
+      .map((p) => p.trim())
+      .filter(Boolean);
+    const turmas = [...new Set(parts)].sort((a, b) =>
+      a.localeCompare(b, "pt-BR"),
+    );
+    if (turmas.length === 0) continue;
+    updQuadro.run(JSON.stringify(turmas), q.id);
+  }
+
+  // Slots antigos herdam a turma do quadro (ou a primeira se for unificado)
+  db.exec(`
+    update quadro_slots
+    set turma_codigo = (
+      select case
+        when instr(q.turma_codigo, '+') > 0
+          then substr(q.turma_codigo, 1, instr(q.turma_codigo, '+') - 1)
+        else q.turma_codigo
+      end
+      from quadros q where q.id = quadro_slots.quadro_id
+    )
+    where turma_codigo is null or trim(turma_codigo) = ''
+  `);
 }
 
 /** Permite mesma turma+turno com disciplinas diferentes. */
@@ -200,6 +249,8 @@ function repairProfessoresEncoding() {
 
 function migrateHorasExtraColumns() {
   ensureColumn("horas_extra", "unidade", "text not null default 'TEMPOS'");
+  ensureColumn("horas_extra", "cargo", "text");
+  ensureColumn("horas_extra", "funcao", "text");
 }
 
 /** Copia lotações legadas da tabela professores (1x) para professor_lotacoes. */
@@ -326,6 +377,8 @@ export function initDb() {
       observacao text,
       lotacao_origem text,
       unidade text not null default 'TEMPOS',
+      cargo text,
+      funcao text,
       created_at text not null default (datetime('now')),
       updated_at text not null default (datetime('now'))
     );
@@ -350,6 +403,7 @@ export function initDb() {
       turno text not null check (turno in ('MANHA', 'TARDE', 'NOITE')),
       disciplina_id text references disciplinas(id) on delete set null,
       observacao text,
+      turmas_json text,
       created_at text not null default (datetime('now')),
       updated_at text not null default (datetime('now')),
       unique (escola_id, turma_codigo, turno, disciplina_id)
@@ -363,6 +417,7 @@ export function initDb() {
       matricula text references professores(matricula) on delete set null,
       tipo text not null default 'REAL' check (tipo in ('REAL', 'TEMPORARIA')),
       expira_em text,
+      turma_codigo text,
       created_at text not null default (datetime('now')),
       updated_at text not null default (datetime('now')),
       unique (quadro_id, dia, periodo)
@@ -408,6 +463,7 @@ export function initDb() {
   migrateProfessoresColumns();
   migrateHorasExtraColumns();
   migrateQuadrosUniqueComDisciplina();
+  migrateQuadrosMultiTurmas();
   repairProfessoresEncoding();
   migrateProfessorLotacoesFromProfessores();
 

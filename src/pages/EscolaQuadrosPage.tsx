@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import {
   ConfirmDialog,
   EmptyState,
@@ -63,12 +63,19 @@ function MiniGrade({ quadro }: { quadro: Quadro }) {
   const map = useMemo(() => {
     const m = new Map<
       string,
-      { matricula: string | null; tipo: string | null }
+      {
+        matricula: string | null;
+        tipo: string | null;
+        modalidade_cobertura: string | null;
+        titular_matricula: string | null;
+      }
     >();
     for (const s of quadro.slots_preview ?? []) {
       m.set(`${s.dia}:${s.periodo}`, {
         matricula: s.matricula,
         tipo: s.tipo ?? "REAL",
+        modalidade_cobertura: s.modalidade_cobertura ?? null,
+        titular_matricula: s.titular_matricula ?? null,
       });
     }
     return m;
@@ -79,7 +86,10 @@ function MiniGrade({ quadro }: { quadro: Quadro }) {
       <div
         className={`px-2 py-1 text-center text-[10px] font-bold tracking-wide ${TURNO_HEADER[quadro.turno]}`}
       >
-        {quadro.turma_codigo}
+        {(quadro.turmas && quadro.turmas.length > 0
+          ? quadro.turmas
+          : [quadro.turma_codigo]
+        ).join(" · ")}
       </div>
       <table className="w-full border-collapse text-[8px] leading-none">
         <thead>
@@ -104,16 +114,31 @@ function MiniGrade({ quadro }: { quadro: Quadro }) {
               {DIAS.map((d) => {
                 const slot = map.get(`${d.id}:${periodo}`);
                 const coberta = !!slot?.matricula;
+                const emLicenca = !!slot?.titular_matricula;
                 const temporaria = slot?.tipo === "TEMPORARIA";
+                const isHoraNormal = slot?.modalidade_cobertura === "NORMAL";
                 let cellClass = "bg-white";
                 let titulo = "Vazio";
                 if (slot) {
-                  if (coberta && temporaria) {
+                  if (emLicenca && !coberta) {
+                    cellClass = "bg-fuchsia-200";
+                    titulo = "Licença em aberto";
+                  } else if (coberta && temporaria && isHoraNormal) {
+                    cellClass = "bg-amber-200";
+                    titulo = emLicenca
+                      ? "Licença · substituto (Hora Normal)"
+                      : "Temporária · Hora Normal";
+                  } else if (coberta && temporaria) {
                     cellClass = "bg-orange-200";
-                    titulo = "Temporária com professor";
+                    titulo = emLicenca
+                      ? "Licença · substituto (Hora Extra)"
+                      : "Temporária · Hora Extra";
+                  } else if (coberta && isHoraNormal) {
+                    cellClass = "bg-teal-200";
+                    titulo = "Real · Hora Normal";
                   } else if (coberta) {
                     cellClass = "bg-emerald-200";
-                    titulo = "Real com professor";
+                    titulo = "Real · Hora Extra";
                   } else if (temporaria) {
                     cellClass = "bg-rose-200";
                     titulo = "Temporária em aberto";
@@ -140,6 +165,14 @@ function MiniGrade({ quadro }: { quadro: Quadro }) {
 
 export function EscolaQuadrosPage() {
   const { escolaId } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const profFiltro = searchParams.get("prof");
+  const disciplinaFiltro = searchParams.get("disciplina");
+  const quadrosFiltro = searchParams.get("quadros")?.split(",").filter(Boolean) ?? [];
+  const temFiltroProf = !!(profFiltro && quadrosFiltro.length > 0);
+  const temFiltroDisc = !!(disciplinaFiltro || (quadrosFiltro.length > 0 && !profFiltro));
+  const temFiltro = temFiltroProf || temFiltroDisc;
+
   const [escola, setEscola] = useState<Escola | null>(null);
   const [quadros, setQuadros] = useState<Quadro[]>([]);
   const [disciplinas, setDisciplinas] = useState<Disciplina[]>([]);
@@ -153,8 +186,13 @@ export function EscolaQuadrosPage() {
   const [loading, setLoading] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<Quadro | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [editingQuadro, setEditingQuadro] = useState<Quadro | null>(null);
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>(null);
+  const [selecionados, setSelecionados] = useState<Set<string>>(new Set());
+  const [mesclando, setMesclando] = useState(false);
+  const [erroMesclaApi, setErroMesclaApi] = useState<string | null>(null);
+  const [professorNome, setProfessorNome] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!escolaId) return;
@@ -174,14 +212,30 @@ export function EscolaQuadrosPage() {
   }, [escolaId]);
 
   useEffect(() => {
+    if (profFiltro) {
+      api<{ nome: string }>(`/professores/${profFiltro}`)
+        .then((p) => setProfessorNome(p.nome))
+        .catch(() => setProfessorNome(null));
+    } else {
+      setProfessorNome(null);
+    }
+  }, [profFiltro]);
+
+  useEffect(() => {
     void load();
   }, [load]);
 
   const quadrosOrdenados = useMemo(() => {
-    if (!sortKey || !sortDir) return quadros;
+    let lista = quadros;
+    if (quadrosFiltro.length > 0) {
+      lista = lista.filter((q) => quadrosFiltro.includes(q.id));
+    } else if (disciplinaFiltro) {
+      lista = lista.filter((q) => q.disciplina_id === disciplinaFiltro);
+    }
+    if (!sortKey || !sortDir) return lista;
 
     const fator = sortDir === "asc" ? 1 : -1;
-    return [...quadros].sort((a, b) => {
+    return [...lista].sort((a, b) => {
       let cmp = 0;
       switch (sortKey) {
         case "turma":
@@ -205,7 +259,7 @@ export function EscolaQuadrosPage() {
       }
       return cmp * fator;
     });
-  }, [quadros, sortKey, sortDir]);
+  }, [quadros, sortKey, sortDir, quadrosFiltro, disciplinaFiltro]);
 
   function alternarOrdenacao(key: SortKey) {
     if (sortKey !== key) {
@@ -222,6 +276,7 @@ export function EscolaQuadrosPage() {
   }
 
   function abrirModal() {
+    setEditingQuadro(null);
     setTurmas([]);
     setTurmaInput("");
     setTurno("MANHA");
@@ -230,9 +285,20 @@ export function EscolaQuadrosPage() {
     setModalAberto(true);
   }
 
+  function abrirModalEditar(quadro: Quadro) {
+    setEditingQuadro(quadro);
+    setTurmas(quadro.turmas && quadro.turmas.length > 0 ? [...quadro.turmas] : [quadro.turma_codigo]);
+    setTurmaInput("");
+    setTurno(quadro.turno);
+    setDisciplinaId(quadro.disciplina_id ?? "");
+    setFormError(null);
+    setModalAberto(true);
+  }
+
   function fecharModal() {
     if (loading) return;
     setModalAberto(false);
+    setEditingQuadro(null);
     setFormError(null);
   }
 
@@ -282,18 +348,30 @@ export function EscolaQuadrosPage() {
     setLoading(true);
     setFormError(null);
     try {
-      await api(`/escolas/${escolaId}/quadros/lote`, {
-        method: "POST",
-        body: JSON.stringify({
-          turmas: lista,
-          turno,
-          disciplina_id: disciplinaId || null,
-        }),
-      });
+      if (editingQuadro) {
+        await api(`/quadros/${editingQuadro.id}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            turmas: lista,
+            turno,
+            disciplina_id: disciplinaId || null,
+          }),
+        });
+      } else {
+        await api(`/escolas/${escolaId}/quadros/lote`, {
+          method: "POST",
+          body: JSON.stringify({
+            turmas: lista,
+            turno,
+            disciplina_id: disciplinaId || null,
+          }),
+        });
+      }
       setModalAberto(false);
+      setEditingQuadro(null);
       await load();
     } catch (err) {
-      setFormError(err instanceof Error ? err.message : "Erro ao criar quadro");
+      setFormError(err instanceof Error ? err.message : editingQuadro ? "Erro ao salvar quadro" : "Erro ao criar quadro");
     } finally {
       setLoading(false);
     }
@@ -314,6 +392,57 @@ export function EscolaQuadrosPage() {
     }
   }
 
+  function toggleSelecionado(id: string) {
+    setErroMesclaApi(null);
+    setSelecionados((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  const quadrosSelecionados = useMemo(
+    () => quadros.filter((q) => selecionados.has(q.id)),
+    [quadros, selecionados],
+  );
+
+  const podeMesclar = quadrosSelecionados.length >= 2;
+
+  const erroMescla = useMemo(() => {
+    if (quadrosSelecionados.length < 2) return null;
+    const turnos = new Set(quadrosSelecionados.map((q) => q.turno));
+    if (turnos.size > 1) {
+      return "Não é possível mesclar quadros de turnos diferentes.";
+    }
+    const disciplinas = new Set(quadrosSelecionados.map((q) => q.disciplina_id ?? ""));
+    if (disciplinas.size > 1) {
+      return "Não é possível mesclar quadros de disciplinas diferentes.";
+    }
+    return null;
+  }, [quadrosSelecionados]);
+
+  async function mesclarQuadros() {
+    if (!podeMesclar || erroMescla) return;
+    setMesclando(true);
+    setErroMesclaApi(null);
+    try {
+      await api("/quadros/mesclar", {
+        method: "POST",
+        body: JSON.stringify({ quadro_ids: [...selecionados] }),
+      });
+      setSelecionados(new Set());
+      await load();
+    } catch (err) {
+      setErroMesclaApi(err instanceof Error ? err.message : "Erro ao mesclar quadros");
+    } finally {
+      setMesclando(false);
+    }
+  }
+
   if (!escola && !error) {
     return <p className="text-sm text-muted">Carregando...</p>;
   }
@@ -322,19 +451,46 @@ export function EscolaQuadrosPage() {
     <div>
       <PageHeader
         title={escola?.nome ?? "Escola"}
-        description="Cada card é um quadro de turma. Turmas do mesmo turno e disciplina compartilham a grade ao abrir."
+        description="Cada card é um quadro de carência. Dá para incluir várias turmas no mesmo quadro."
         actions={
           <>
             <button type="button" className={btnPrimary} onClick={abrirModal}>
               Novo quadro
             </button>
-            <Link to="/carencias" className={btnSecondary}>
+            <Link to="/carencias/doc1" className={btnSecondary}>
               Voltar
             </Link>
           </>
         }
       />
       <ErrorBanner message={error} />
+
+      {temFiltro && (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-lg border border-brand bg-brand-soft/30 px-4 py-3">
+          <svg className="h-5 w-5 flex-shrink-0 text-brand" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
+          </svg>
+          <span className="text-sm">
+            Mostrando <strong className="text-brand">{quadrosOrdenados.length} quadro(s)</strong>
+            {professorNome && (
+              <>
+                {" "}onde <strong className="text-brand">{professorNome}</strong> está alocado
+              </>
+            )}
+            {temFiltroDisc && !professorNome && (
+              <> filtrados pela disciplina</>
+            )}
+            {" "}(de {quadros.length} total)
+          </span>
+          <button
+            type="button"
+            className="rounded-md bg-brand px-3 py-1 text-xs font-medium text-white transition hover:bg-brand-dark"
+            onClick={() => setSearchParams({})}
+          >
+            Limpar filtro
+          </button>
+        </div>
+      )}
 
       {quadros.length > 0 ? (
         <div className="mb-4 flex flex-wrap items-center gap-1">
@@ -353,7 +509,7 @@ export function EscolaQuadrosPage() {
               </button>
             );
           })}
-          <span className="ml-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted">
+          <span className="ml-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted">
             <span className="inline-flex items-center gap-1">
               <span className="inline-block h-2.5 w-2.5 rounded-sm bg-sky-200" />
               Real aberto
@@ -363,12 +519,24 @@ export function EscolaQuadrosPage() {
               Temp. aberto
             </span>
             <span className="inline-flex items-center gap-1">
-              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-orange-200" />
-              Temp. c/ prof.
+              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-200" />
+              Real·HE
             </span>
             <span className="inline-flex items-center gap-1">
-              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-emerald-200" />
-              Real c/ prof.
+              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-teal-200" />
+              Real·Normal
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-orange-200" />
+              Temp·HE
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-amber-200" />
+              Temp·Normal
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-2.5 w-2.5 rounded-sm bg-fuchsia-200" />
+              Licença
             </span>
           </span>
         </div>
@@ -380,47 +548,82 @@ export function EscolaQuadrosPage() {
         </Panel>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {quadrosOrdenados.map((q) => (
-            <Panel key={q.id} className="flex flex-col gap-3">
-              <div className="flex items-start justify-between gap-2">
-                <div>
-                  <h2 className="font-display text-lg font-semibold text-brand-dark">
-                    {q.turma_codigo}
-                  </h2>
-                  <p className="text-sm text-muted">
-                    {TURNO_LABEL[q.turno]}
-                    {q.disciplina_codigo ? ` · ${q.disciplina_codigo}` : ""}
-                  </p>
+          {quadrosOrdenados.map((q) => {
+            const selecionado = selecionados.has(q.id);
+            return (
+              <Panel
+                key={q.id}
+                className={`flex flex-col gap-3 transition-shadow ${
+                  selecionado ? "ring-2 ring-brand" : ""
+                }`}
+              >
+                <div className="flex items-start gap-3">
+                  <label className="mt-1 flex cursor-pointer items-center">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 cursor-pointer rounded border-border text-brand focus:ring-brand"
+                      checked={selecionado}
+                      onChange={() => toggleSelecionado(q.id)}
+                    />
+                  </label>
+                  <div className="flex flex-1 items-start justify-between gap-2">
+                    <div>
+                      <h2 className="font-display text-lg font-semibold text-brand-dark">
+                        {(q.turmas && q.turmas.length > 0
+                          ? q.turmas
+                          : [q.turma_codigo]
+                        ).join(" · ")}
+                      </h2>
+                      <p className="text-sm text-muted">
+                        {TURNO_LABEL[q.turno]}
+                        {q.disciplina_codigo ? ` · ${q.disciplina_codigo}` : ""}
+                        {(q.turmas?.length ?? 0) > 1
+                          ? ` · ${q.turmas!.length} turmas`
+                          : ""}
+                      </p>
+                    </div>
+                    <div className="text-right text-xs text-muted">
+                      <p>
+                        <span className="font-semibold text-foreground">
+                          {q.total_slots ?? 0}
+                        </span>{" "}
+                        tempos
+                      </p>
+                      <p className="text-warn">
+                        {q.slots_abertos ?? 0} em aberto
+                      </p>
+                    </div>
+                  </div>
                 </div>
-                <div className="text-right text-xs text-muted">
-                  <p>
-                    <span className="font-semibold text-foreground">
-                      {q.total_slots ?? 0}
-                    </span>{" "}
-                    tempos
-                  </p>
-                  <p className="text-warn">
-                    {q.slots_abertos ?? 0} em aberto
-                  </p>
+
+                <MiniGrade quadro={q} />
+
+                <div className="mt-auto flex items-center gap-2 pt-1">
+                  <Link
+                    to={`/carencias/doc1/${escolaId}/${q.id}`}
+                    className={`${btnPrimary} flex-1`}
+                  >
+                    Abrir
+                  </Link>
+                  <button
+                    type="button"
+                    className="rounded-md p-2 text-muted transition hover:bg-brand-soft hover:text-brand"
+                    title="Editar quadro"
+                    aria-label={`Editar quadro ${q.turma_codigo}`}
+                    onClick={() => abrirModalEditar(q)}
+                  >
+                    <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zm0 0L19.5 7.125" />
+                    </svg>
+                  </button>
+                  <IconDeleteButton
+                    label={`Excluir quadro ${q.turma_codigo}`}
+                    onClick={() => setPendingDelete(q)}
+                  />
                 </div>
-              </div>
-
-              <MiniGrade quadro={q} />
-
-              <div className="mt-auto flex items-center gap-2 pt-1">
-                <Link
-                  to={`/carencias/${escolaId}/${q.id}`}
-                  className={`${btnPrimary} flex-1`}
-                >
-                  Abrir
-                </Link>
-                <IconDeleteButton
-                  label={`Excluir quadro ${q.turma_codigo}`}
-                  onClick={() => setPendingDelete(q)}
-                />
-              </div>
-            </Panel>
-          ))}
+              </Panel>
+            );
+          })}
         </div>
       )}
 
@@ -442,7 +645,7 @@ export function EscolaQuadrosPage() {
                 id="modal-novo-quadro-titulo"
                 className="font-display text-xl font-semibold text-brand-dark"
               >
-                Novo quadro (turmas)
+                {editingQuadro ? "Editar quadro" : "Novo quadro de carência"}
               </h2>
               <button
                 type="button"
@@ -508,7 +711,8 @@ export function EscolaQuadrosPage() {
                   />
                 </div>
                 <p className="mt-1 text-xs text-muted">
-                  Pode criar várias turmas de uma vez no mesmo turno e disciplina.
+                  Todas entram no mesmo quadro. Na grade você escolhe qual turma
+                  marcar em cada horário.
                 </p>
               </Field>
               <Field label="Turno">
@@ -551,12 +755,8 @@ export function EscolaQuadrosPage() {
                 </button>
                 <button className={btnPrimary} disabled={loading}>
                   {loading
-                    ? "Criando..."
-                    : turmas.length > 1 ||
-                        (turmas.length === 0 &&
-                          /[,;\s]/.test(turmaInput.trim()))
-                      ? "Criar quadros"
-                      : "Criar quadro"}
+                    ? editingQuadro ? "Salvando..." : "Criando..."
+                    : editingQuadro ? "Salvar" : "Criar quadro"}
                 </button>
               </div>
             </form>
@@ -577,6 +777,54 @@ export function EscolaQuadrosPage() {
           if (!deleting) setPendingDelete(null);
         }}
       />
+
+      {/* Barra flutuante de seleção */}
+      {selecionados.size > 0 && (
+        <div className="pointer-events-none fixed inset-x-3 bottom-5 z-50 flex justify-center lg:left-[calc(var(--app-sidebar,16rem)+1.5rem)] lg:right-6">
+          <div className="pointer-events-auto w-full max-w-2xl overflow-hidden rounded-2xl border border-border bg-surface/95 text-foreground shadow-[0_12px_40px_-16px_rgba(28,42,51,0.35)] backdrop-blur-md">
+            <div className="flex items-center justify-between gap-4 px-4 py-3">
+              <div className="flex items-center gap-3">
+                <span className="inline-flex h-8 min-w-8 items-center justify-center rounded-full bg-brand px-2.5 text-sm font-semibold tabular-nums text-white">
+                  {selecionados.size}
+                </span>
+                <div>
+                  <p className="text-sm font-medium leading-none text-brand-dark">
+                    quadro{selecionados.size === 1 ? "" : "s"} selecionado
+                    {selecionados.size === 1 ? "" : "s"}
+                  </p>
+                  <p className="mt-0.5 text-xs text-muted">
+                    {erroMescla ?? erroMesclaApi ?? "Selecione 2+ para mesclar"}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {podeMesclar && !erroMescla && (
+                  <button
+                    type="button"
+                    className="h-8 cursor-pointer rounded-lg bg-brand px-4 text-xs font-semibold text-white transition hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-45"
+                    disabled={mesclando}
+                    onClick={() => void mesclarQuadros()}
+                  >
+                    {mesclando ? "Mesclando..." : "Mesclar"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="cursor-pointer rounded-lg px-3 py-1.5 text-xs font-medium text-muted transition hover:bg-brand-soft/60 hover:text-brand-dark"
+                  onClick={() => setSelecionados(new Set())}
+                >
+                  Limpar
+                </button>
+              </div>
+            </div>
+            {(erroMescla || erroMesclaApi) && (
+              <div className="border-t border-danger/20 bg-red-50 px-4 py-2 text-xs text-danger">
+                {erroMescla || erroMesclaApi}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

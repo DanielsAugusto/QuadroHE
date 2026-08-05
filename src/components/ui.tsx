@@ -61,12 +61,14 @@ export function Modal({
   onClose,
   children,
   wide = false,
+  tall = false,
 }: {
   open: boolean;
   title: string;
   onClose: () => void;
   children: ReactNode;
   wide?: boolean;
+  tall?: boolean;
 }) {
   useEffect(() => {
     if (!open) return;
@@ -91,9 +93,9 @@ export function Modal({
       role="presentation"
     >
       <div
-        className={`max-h-[90vh] w-full overflow-y-auto rounded-2xl border border-border bg-surface p-5 shadow-xl ${
-          wide ? "max-w-xl" : "max-w-md"
-        }`}
+        className={`w-full overflow-y-auto rounded-2xl border border-border bg-surface p-5 shadow-xl max-h-[90vh] ${
+          tall ? "min-h-[480px]" : ""
+        } ${wide ? "max-w-xl" : "max-w-md"}`}
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
@@ -125,7 +127,7 @@ export function ConfirmDialog({
 }: {
   open: boolean;
   title?: string;
-  message: string;
+  message: React.ReactNode;
   confirmLabel?: string;
   cancelLabel?: string;
   loading?: boolean;

@@ -8,6 +8,11 @@ import { ConfiguracaoPage } from "@/pages/ConfiguracaoPage";
 import { HoraExtraPage } from "@/pages/HoraExtraPage";
 import { AlocacoesPage } from "@/pages/AlocacoesPage";
 import { CarenciasPage } from "@/pages/CarenciasPage";
+import { CarenciasSelecaoPage } from "@/pages/CarenciasSelecaoPage";
+import { CarenciasDoc2Page } from "@/pages/CarenciasDoc2Page";
+import { CarenciasDisciplinasPage } from "@/pages/CarenciasDisciplinasPage";
+import { CarenciasDisciplinaEscolasPage } from "@/pages/CarenciasDisciplinaEscolasPage";
+import { CarenciasPainelPage } from "@/pages/CarenciasPainelPage";
 import { ContagensPage } from "@/pages/ContagensPage";
 import { EscolaQuadrosPage } from "@/pages/EscolaQuadrosPage";
 import { EscolasLotacaoPage } from "@/pages/EscolasLotacaoPage";
@@ -95,7 +100,63 @@ export default function App() {
         path="/carencias"
         element={
           <Protected>
+            <CarenciasSelecaoPage />
+          </Protected>
+        }
+      />
+      <Route
+        path="/carencias/doc1"
+        element={
+          <Protected>
             <CarenciasPage />
+          </Protected>
+        }
+      />
+      <Route
+        path="/carencias/doc1/painel"
+        element={
+          <Protected>
+            <CarenciasPainelPage />
+          </Protected>
+        }
+      />
+      <Route
+        path="/carencias/doc1/disciplinas"
+        element={
+          <Protected>
+            <CarenciasDisciplinasPage />
+          </Protected>
+        }
+      />
+      <Route
+        path="/carencias/doc1/disciplinas/:disciplinaId"
+        element={
+          <Protected>
+            <CarenciasDisciplinaEscolasPage />
+          </Protected>
+        }
+      />
+      <Route
+        path="/carencias/doc1/:escolaId"
+        element={
+          <Protected>
+            <EscolaQuadrosPage />
+          </Protected>
+        }
+      />
+      <Route
+        path="/carencias/doc1/:escolaId/:quadroId"
+        element={
+          <Protected>
+            <QuadroTurmaPage />
+          </Protected>
+        }
+      />
+      <Route
+        path="/carencias/doc2"
+        element={
+          <Protected>
+            <CarenciasDoc2Page />
           </Protected>
         }
       />
@@ -104,22 +165,6 @@ export default function App() {
         element={
           <Protected>
             <ContagensPage />
-          </Protected>
-        }
-      />
-      <Route
-        path="/carencias/:escolaId"
-        element={
-          <Protected>
-            <EscolaQuadrosPage />
-          </Protected>
-        }
-      />
-      <Route
-        path="/carencias/:escolaId/:quadroId"
-        element={
-          <Protected>
-            <QuadroTurmaPage />
           </Protected>
         }
       />

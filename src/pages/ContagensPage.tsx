@@ -31,9 +31,16 @@ const FOLHAS_PDF: Array<{ id: FolhaPdf; label: string }> = [
   { id: "tabloid", label: "Tabloide" },
 ];
 
+type MapaoDimensao = "funcoes" | "cargos";
+
 export function ContagensPage() {
-  const [lotacao, setLotacao] = useState<LotacaoContagensGeral | null>(null);
+  const [lotacaoByDim, setLotacaoByDim] = useState<{
+    funcoes: LotacaoContagensGeral | null;
+    cargos: LotacaoContagensGeral | null;
+  }>({ funcoes: null, cargos: null });
+  const [loadingLotacao, setLoadingLotacao] = useState(true);
   const [carencias, setCarencias] = useState<CarenciaContagens | null>(null);
+  const [loadingCarencias, setLoadingCarencias] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busca, setBusca] = useState("");
   const [aba, setAba] = useState<Aba>("lotacao");
@@ -48,23 +55,58 @@ export function ContagensPage() {
   );
   const [painelColunas, setPainelColunas] = useState(false);
   const [buscaColuna, setBuscaColuna] = useState("");
-  const [mapaoDimensao, setMapaoDimensao] = useState<"funcoes" | "cargos">(
-    "funcoes",
-  );
+  const [mapaoDimensao, setMapaoDimensao] = useState<MapaoDimensao>("funcoes");
+
+  const lotacao = lotacaoByDim[mapaoDimensao];
+
+  const loadLotacao = useCallback(async (dimensao: MapaoDimensao) => {
+    setLoadingLotacao(true);
+    setError(null);
+    try {
+      const lot = await api<LotacaoContagensGeral>(
+        `/lotacao/contagens?dimensao=${dimensao}`,
+      );
+      setLotacaoByDim((prev) => ({ ...prev, [dimensao]: lot }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erro ao carregar lotação");
+    } finally {
+      setLoadingLotacao(false);
+    }
+  }, []);
+
+  const lotacaoCache = lotacaoByDim[mapaoDimensao];
+  useEffect(() => {
+    if (lotacaoCache) {
+      setLoadingLotacao(false);
+      return;
+    }
+    void loadLotacao(mapaoDimensao);
+  }, [mapaoDimensao, lotacaoCache, loadLotacao]);
 
   useEffect(() => {
-    Promise.all([
-      api<CarenciaContagens>("/carencias/contagens"),
-      api<LotacaoContagensGeral>("/lotacao/contagens"),
-    ])
-      .then(([car, lot]) => {
-        setCarencias(car);
-        setLotacao(lot);
+    if (aba !== "materias" && aba !== "escolas") return;
+    if (carencias) return;
+    let cancelled = false;
+    setLoadingCarencias(true);
+    setError(null);
+    api<CarenciaContagens>("/carencias/contagens")
+      .then((data) => {
+        if (!cancelled) setCarencias(data);
       })
-      .catch((err) =>
-        setError(err instanceof Error ? err.message : "Erro ao carregar"),
-      );
-  }, []);
+      .catch((err) => {
+        if (!cancelled) {
+          setError(
+            err instanceof Error ? err.message : "Erro ao carregar carências",
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingCarencias(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [aba, carencias]);
 
   useEffect(() => {
     setExpandida(null);
@@ -80,13 +122,12 @@ export function ContagensPage() {
     const items = lotacao?.escolas ?? [];
     const q = busca.trim().toLowerCase();
     if (!q) return items;
-    return items.filter(
-      (e) =>
-        e.nome.toLowerCase().includes(q) ||
-        e.cargos.some((c) => c.nome.toLowerCase().includes(q)) ||
-        e.funcoes.some((f) => f.nome.toLowerCase().includes(q)),
-    );
-  }, [lotacao, busca]);
+    return items.filter((e) => {
+      if (e.nome.toLowerCase().includes(q)) return true;
+      const itens = mapaoDimensao === "funcoes" ? e.funcoes : e.cargos;
+      return itens.some((c) => c.nome.toLowerCase().includes(q));
+    });
+  }, [lotacao, busca, mapaoDimensao]);
 
   const mapaoColunasTodas = useMemo(() => {
     const totais = new Map<string, number>();
@@ -384,7 +425,11 @@ export function ContagensPage() {
     );
   }, [carencias, busca]);
 
-  const loading = !lotacao && !carencias && !error;
+  const showLotacaoSkeleton = aba === "lotacao" && loadingLotacao && !lotacao;
+  const showCarenciasSkeleton =
+    (aba === "materias" || aba === "escolas") &&
+    loadingCarencias &&
+    !carencias;
 
   return (
     <div className="min-w-0 max-w-full">
@@ -394,34 +439,36 @@ export function ContagensPage() {
       />
       <ErrorBanner message={error} />
 
-      {loading ? (
-        <p className="text-sm text-muted">Carregando mapa...</p>
-      ) : (
-        <>
-          <div className="mb-4 flex flex-wrap items-center gap-2">
-            {(
-              [
-                { id: "lotacao" as const, label: "Lotação por escola" },
-                { id: "materias" as const, label: "Carências · matéria" },
-                { id: "escolas" as const, label: "Carências · escola" },
-              ] as const
-            ).map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                onClick={() => setAba(t.id)}
-                className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
-                  aba === t.id
-                    ? "bg-brand text-white"
-                    : "border border-border bg-white text-foreground hover:bg-brand-soft/40"
-                }`}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
+      <div className="mb-4 flex flex-wrap items-center gap-2">
+        {(
+          [
+            { id: "lotacao" as const, label: "Lotação por escola" },
+            { id: "materias" as const, label: "Carências · matéria" },
+            { id: "escolas" as const, label: "Carências · escola" },
+          ] as const
+        ).map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setAba(t.id)}
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
+              aba === t.id
+                ? "bg-brand text-white"
+                : "border border-border bg-white text-foreground hover:bg-brand-soft/40"
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
 
-          {aba === "lotacao" && lotacao ? (
+      {showLotacaoSkeleton || showCarenciasSkeleton ? <ContagensSkeleton /> : null}
+
+      {aba === "lotacao" && loadingLotacao && lotacao ? (
+        <p className="mb-3 text-xs text-muted">Atualizando mapão...</p>
+      ) : null}
+
+      {aba === "lotacao" && lotacao ? (
             <div className="min-w-0 max-w-full">
               <div className="mb-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
                 <StatCard label="Escolas" value={lotacao.escolas.length} />
@@ -770,7 +817,7 @@ export function ContagensPage() {
                                         <td className="py-2 pr-3" />
                                         <td className="py-2 pr-3 text-muted">
                                           <Link
-                                            to={`/carencias/${e.escola_id}`}
+                                            to={`/carencias/doc1/${e.escola_id}`}
                                             className="text-brand hover:underline"
                                             onClick={(ev) =>
                                               ev.stopPropagation()
@@ -864,7 +911,7 @@ export function ContagensPage() {
                                 >
                                   <td className="py-2.5 pr-3 font-medium">
                                     <Link
-                                      to={`/carencias/${e.escola_id}`}
+                                      to={`/carencias/doc1/${e.escola_id}`}
                                       className="text-brand hover:underline"
                                       onClick={(ev) => ev.stopPropagation()}
                                     >
@@ -911,8 +958,6 @@ export function ContagensPage() {
               )}
             </>
           ) : null}
-        </>
-      )}
 
       <Modal
         open={modalPdfOpen}
@@ -971,6 +1016,35 @@ export function ContagensPage() {
           </div>
         </div>
       </Modal>
+    </div>
+  );
+}
+
+function ContagensSkeleton() {
+  return (
+    <div className="animate-pulse space-y-4" aria-busy="true" aria-label="Carregando">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {[0, 1, 2].map((i) => (
+          <div
+            key={i}
+            className="h-20 rounded-lg border border-border bg-brand-soft/40"
+          />
+        ))}
+      </div>
+      <div className="overflow-hidden rounded-lg border border-border bg-surface">
+        <div className="space-y-2 p-4">
+          <div className="h-4 w-48 rounded bg-brand-soft/50" />
+          <div className="h-3 w-72 rounded bg-border/80" />
+        </div>
+        <div className="space-y-1 px-4 pb-4">
+          {Array.from({ length: 8 }, (_, i) => (
+            <div key={i} className="flex gap-2">
+              <div className="h-8 w-40 shrink-0 rounded bg-brand-soft/40" />
+              <div className="h-8 flex-1 rounded bg-border/50" />
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

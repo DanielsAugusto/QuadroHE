@@ -31,6 +31,19 @@ export type Professor = {
   extras?: Record<string, string | number> | string | null;
 };
 
+export type ProfessorLotacao = {
+  id: string;
+  matricula: string;
+  escola?: string | null;
+  tipohora?: string | null;
+  cod_lotacao?: string | null;
+  lotacao?: string | null;
+  padrao?: string | null;
+  funcao?: string | null;
+  dt_inicio?: string | null;
+  observacao?: string | null;
+};
+
 export type Escola = {
   id: string;
   nome: string;
@@ -138,6 +151,8 @@ export type HoraExtra = {
   observacao: string | null;
   lotacao_origem: string | null;
   unidade?: string | null;
+  cargo?: string | null;
+  funcao?: string | null;
   professor_nome?: string;
   professor_cargo?: string | null;
   professor_funcao?: string | null;
@@ -164,6 +179,8 @@ export type Quadro = {
   id: string;
   escola_id: string;
   turma_codigo: string;
+  /** Lista de turmas deste quadro (um quadro pode ter várias). */
+  turmas?: string[];
   turno: Turno;
   disciplina_id: string | null;
   observacao: string | null;
@@ -177,10 +194,14 @@ export type Quadro = {
     periodo: number;
     matricula: string | null;
     tipo?: TipoCarencia | null;
+    turma_codigo?: string | null;
+    modalidade_cobertura?: ModalidadeCobertura | null;
+    titular_matricula?: string | null;
   }>;
 };
 
 export type TipoCarencia = "REAL" | "TEMPORARIA";
+export type ModalidadeCobertura = "NORMAL" | "HORA_EXTRA";
 
 export type QuadroSlot = {
   id: string;
@@ -190,16 +211,28 @@ export type QuadroSlot = {
   matricula: string | null;
   tipo?: TipoCarencia;
   expira_em?: string | null;
+  modalidade_cobertura?: ModalidadeCobertura | null;
+  /** Titular afastado por licença (mantido enquanto a carência temporária estiver aberta). */
+  titular_matricula?: string | null;
+  titular_modalidade?: ModalidadeCobertura | null;
   professor_nome?: string | null;
+  titular_nome?: string | null;
   turma_codigo?: string;
   turno?: Turno;
   escola_id?: string;
   escola_nome?: string;
+  /** Presente na ficha: slot em que o professor é o titular de licença. */
+  em_licenca?: boolean | number;
 };
 
 export const TIPO_CARENCIA_LABEL: Record<TipoCarencia, string> = {
   REAL: "Real",
   TEMPORARIA: "Temporária",
+};
+
+export const MODALIDADE_COBERTURA_LABEL: Record<ModalidadeCobertura, string> = {
+  NORMAL: "Hora Normal",
+  HORA_EXTRA: "Hora Extra",
 };
 
 export type SaldoProfessor = {

@@ -3,12 +3,31 @@ import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { requireAuth } from "../auth.js";
 import {
+  hydrateQuadroRow,
+  normalizeTurmas,
+  parseTurmasJson,
+  turmaLabel,
+} from "../quadroTurmas.js";
+import {
   repairMojibakeText,
   repairMojibakeValue,
 } from "../../src/lib/textEncoding.ts";
 
 export const apiRouter = Router();
 apiRouter.use(requireAuth);
+
+/** Cache curto do mapão / contagens (TTL + invalidação em mutações). */
+const lotacaoContagensCache = new Map<string, { at: number; data: unknown }>();
+let carenciasContagensCache: { at: number; data: unknown } | null = null;
+const CONTAGENS_CACHE_TTL_MS = 60_000;
+
+function invalidateLotacaoContagensCache() {
+  lotacaoContagensCache.clear();
+}
+
+function invalidateCarenciasContagensCache() {
+  carenciasContagensCache = null;
+}
 
 function listQuery(req: Request) {
   const url = new URL(req.originalUrl || req.url, "http://localhost");
@@ -101,16 +120,28 @@ apiRouter.get("/professores/:matricula", (req, res) => {
 
   const slots = db
     .prepare(
-      `select s.*, q.turma_codigo, q.turno, q.escola_id, e.nome as escola_nome
+      `select s.*,
+              q.turma_codigo as quadro_turmas, q.turno, q.escola_id, e.nome as escola_nome,
+              p.nome as professor_nome,
+              pt.nome as titular_nome,
+              case when s.titular_matricula = ? then 1 else 0 end as em_licenca
        from quadro_slots s
        join quadros q on q.id = s.quadro_id
        left join escolas e on e.id = q.escola_id
-       where s.matricula = ?
+       left join professores p on p.matricula = s.matricula
+       left join professores pt on pt.matricula = s.titular_matricula
+       where s.matricula = ? or s.titular_matricula = ?
        order by e.nome, q.turma_codigo, q.turno, s.dia, s.periodo`,
+    )
+    .all(req.params.matricula, req.params.matricula, req.params.matricula);
+
+  const lotacoes = db
+    .prepare(
+      `select * from professor_lotacoes where matricula = ? order by dt_inicio desc, created_at desc`,
     )
     .all(req.params.matricula);
 
-  res.json({ professor, horas_extra, alocacoes, slots });
+  res.json({ professor, horas_extra, alocacoes, slots, lotacoes });
 });
 
 apiRouter.post("/professores", (req, res) => {
@@ -130,6 +161,7 @@ apiRouter.post("/professores", (req, res) => {
     const row = db
       .prepare("select * from professores where matricula = ?")
       .get(matricula);
+    invalidateLotacaoContagensCache();
     return res.status(201).json(row);
   } catch {
     return res.status(409).json({ error: "Matrícula já cadastrada" });
@@ -305,6 +337,7 @@ apiRouter.post("/professores/import", (req, res) => {
     });
   }
 
+  invalidateLotacaoContagensCache();
   return res.json({ criados, atualizados, lotacoes, ignorados, erros });
 });
 
@@ -327,11 +360,13 @@ apiRouter.put("/professores/:matricula", (req, res) => {
   const row = db
     .prepare("select * from professores where matricula = ?")
     .get(req.params.matricula);
+  invalidateLotacaoContagensCache();
   return res.json(row);
 });
 
 apiRouter.delete("/professores", (_req, res) => {
   const result = db.prepare("delete from professores").run();
+  invalidateLotacaoContagensCache();
   return res.json({ deleted: Number(result.changes) });
 });
 
@@ -342,6 +377,7 @@ apiRouter.delete("/professores/:matricula", (req, res) => {
   if (result.changes === 0) {
     return res.status(404).json({ error: "Não encontrado" });
   }
+  invalidateLotacaoContagensCache();
   return res.status(204).send();
 });
 
@@ -422,6 +458,22 @@ apiRouter.get("/lotacao/contagens", (req, res) => {
     req.query.unicas === "1" ||
     req.query.unicas === "true" ||
     req.query.unicas === "sim";
+  const dimensaoRaw = String(req.query.dimensao ?? "ambas").toLowerCase();
+  const dimensao =
+    dimensaoRaw === "funcoes" || dimensaoRaw === "cargos"
+      ? dimensaoRaw
+      : "ambas";
+  const wantCargos = dimensao === "ambas" || dimensao === "cargos";
+  const wantFuncoes = dimensao === "ambas" || dimensao === "funcoes";
+
+  // Cache só para o mapão geral (sem filtro de escola).
+  if (!escola) {
+    const cacheKey = `${unicas ? "1" : "0"}:${dimensao}`;
+    const hit = lotacaoContagensCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < CONTAGENS_CACHE_TTL_MS) {
+      return res.json(hit.data);
+    }
+  }
 
   const totalExpr = unicas ? "count(distinct l.matricula)" : "count(*)";
   const heExpr = unicas
@@ -520,25 +572,26 @@ apiRouter.get("/lotacao/contagens", (req, res) => {
 
   if (escola) {
     const totais = queryTotaisEscola(escola)[0];
-    const cargos = queryCargos(escola).map(
-      ({ nome, total, hora_extra, normal }) => ({
-        nome,
-        total: Number(total),
-        hora_extra: Number(hora_extra),
-        normal: Number(normal),
-      }),
-    );
-    const funcoes = queryFuncoes(escola).map(
-      ({ nome, total, hora_extra, normal }) => ({
-        nome,
-        total: Number(total),
-        hora_extra: Number(hora_extra),
-        normal: Number(normal),
-      }),
-    );
+    const cargos = wantCargos
+      ? queryCargos(escola).map(({ nome, total, hora_extra, normal }) => ({
+          nome,
+          total: Number(total),
+          hora_extra: Number(hora_extra),
+          normal: Number(normal),
+        }))
+      : [];
+    const funcoes = wantFuncoes
+      ? queryFuncoes(escola).map(({ nome, total, hora_extra, normal }) => ({
+          nome,
+          total: Number(total),
+          hora_extra: Number(hora_extra),
+          normal: Number(normal),
+        }))
+      : [];
     return res.json({
       escola,
       unicas,
+      dimensao,
       total: Number(totais?.total ?? 0),
       normal: Number(totais?.normal ?? 0),
       hora_extra: Number(totais?.hora_extra ?? 0),
@@ -588,24 +641,28 @@ apiRouter.get("/lotacao/contagens", (req, res) => {
     e.normal = Number(row.normal);
   }
 
-  for (const row of queryCargos(null)) {
-    const e = ensure(row.escola);
-    e.cargos.push({
-      nome: row.nome,
-      total: Number(row.total),
-      hora_extra: Number(row.hora_extra),
-      normal: Number(row.normal),
-    });
+  if (wantCargos) {
+    for (const row of queryCargos(null)) {
+      const e = ensure(row.escola);
+      e.cargos.push({
+        nome: row.nome,
+        total: Number(row.total),
+        hora_extra: Number(row.hora_extra),
+        normal: Number(row.normal),
+      });
+    }
   }
 
-  for (const row of queryFuncoes(null)) {
-    const e = ensure(row.escola);
-    e.funcoes.push({
-      nome: row.nome,
-      total: Number(row.total),
-      hora_extra: Number(row.hora_extra),
-      normal: Number(row.normal),
-    });
+  if (wantFuncoes) {
+    for (const row of queryFuncoes(null)) {
+      const e = ensure(row.escola);
+      e.funcoes.push({
+        nome: row.nome,
+        total: Number(row.total),
+        hora_extra: Number(row.hora_extra),
+        normal: Number(row.normal),
+      });
+    }
   }
 
   const escolas = [...map.values()].sort(
@@ -617,7 +674,19 @@ apiRouter.get("/lotacao/contagens", (req, res) => {
   const hora_extra = escolas.reduce((acc, e) => acc + e.hora_extra, 0);
   const normal = escolas.reduce((acc, e) => acc + e.normal, 0);
 
-  res.json({ total, normal, hora_extra, unicas, escolas });
+  const payload = {
+    total,
+    normal,
+    hora_extra,
+    unicas,
+    dimensao,
+    escolas,
+  };
+  lotacaoContagensCache.set(`${unicas ? "1" : "0"}:${dimensao}`, {
+    at: Date.now(),
+    data: payload,
+  });
+  res.json(payload);
 });
 
 apiRouter.get("/lotacao/opcoes", (_req, res) => {
@@ -765,6 +834,13 @@ apiRouter.get("/carencias/escolas-resumo", (_req, res) => {
 });
 
 apiRouter.get("/carencias/contagens", (_req, res) => {
+  if (
+    carenciasContagensCache &&
+    Date.now() - carenciasContagensCache.at < CONTAGENS_CACHE_TTL_MS
+  ) {
+    return res.json(carenciasContagensCache.data);
+  }
+
   const porEscola = db
     .prepare(
       `select
@@ -885,7 +961,9 @@ apiRouter.get("/carencias/contagens", (_req, res) => {
     );
 
   const total_abertos = disciplinas.reduce((acc, d) => acc + d.abertos, 0);
-  res.json({ total_abertos, disciplinas, escolas });
+  const payload = { total_abertos, disciplinas, escolas };
+  carenciasContagensCache = { at: Date.now(), data: payload };
+  res.json(payload);
 });
 
 apiRouter.get("/carencias/escolas-disponiveis", (_req, res) => {
@@ -899,9 +977,410 @@ apiRouter.get("/carencias/escolas-disponiveis", (_req, res) => {
 });
 
 /**
- * Importa carências a partir de itens já parseados da planilha visual
- * (escola × turma × turno × dia × período × disciplina).
- * Cria/ativa escolas, cria/reusa quadros e abre slots sem professor.
+ * Painel de controle: escolas × disciplinas com Real / Temporária / HE Real / HE Temporária.
+ * Contagens:
+ *  - real / temporaria: slots em aberto (sem professor)
+ *  - he_real / he_temporaria: slots cobertos em Hora Extra
+ */
+apiRouter.get("/carencias/painel", (_req, res) => {
+  // Ordem do mapa estatístico (print)
+  const ORDEM_CODIGOS = ["PT", "MAT", "HIS", "CIE", "GEO", "ART", "ING", "EF"];
+
+  // Todas as matérias cadastradas (mesmo zeradas), exceto DOC II
+  let discRows = db
+    .prepare(
+      `select
+         id,
+         coalesce(nullif(trim(codigo), ''), '—') as codigo,
+         coalesce(nullif(trim(nome), ''), '(sem matéria)') as nome
+       from disciplinas
+       where upper(trim(coalesce(codigo, ''))) not in ('DOC II', 'DOCII', 'DOC  II')
+         and upper(trim(coalesce(nome, ''))) not like '%DOC II%'
+         and upper(trim(coalesce(nome, ''))) not like '%DOCENTE II%'
+       order by nome collate nocase, codigo collate nocase`,
+    )
+    .all() as Array<{ id: string; codigo: string; nome: string }>;
+
+  const temSemMateria = db
+    .prepare(
+      `select 1 as ok
+       from quadro_slots s
+       join quadros q on q.id = s.quadro_id
+       join escolas e on e.id = q.escola_id
+       where e.em_carencias = 1
+         and (q.disciplina_id is null or trim(q.disciplina_id) = '')
+       limit 1`,
+    )
+    .get() as { ok: number } | undefined;
+
+  if (temSemMateria) {
+    discRows.push({ id: "", codigo: "—", nome: "(sem matéria)" });
+  }
+
+  discRows = [...discRows].sort((a, b) => {
+    const ia = ORDEM_CODIGOS.indexOf(String(a.codigo).toUpperCase());
+    const ib = ORDEM_CODIGOS.indexOf(String(b.codigo).toUpperCase());
+    const ra = ia === -1 ? 999 : ia;
+    const rb = ib === -1 ? 999 : ib;
+    if (ra !== rb) return ra - rb;
+    return a.nome.localeCompare(b.nome, "pt-BR");
+  });
+
+  const slotRows = db
+    .prepare(
+      `select
+         e.id as escola_id,
+         e.nome as escola_nome,
+         coalesce(d.id, '') as disciplina_id,
+         coalesce(nullif(trim(d.codigo), ''), '—') as codigo,
+         coalesce(d.nome, '(sem matéria)') as disciplina_nome,
+         s.tipo,
+         s.matricula,
+         s.modalidade_cobertura
+       from quadro_slots s
+       join quadros q on q.id = s.quadro_id
+       join escolas e on e.id = q.escola_id
+       left join disciplinas d on d.id = q.disciplina_id
+       where e.em_carencias = 1`,
+    )
+    .all() as Array<{
+    escola_id: string;
+    escola_nome: string;
+    disciplina_id: string;
+    codigo: string;
+    disciplina_nome: string;
+    tipo: string;
+    matricula: string | null;
+    modalidade_cobertura: string | null;
+  }>;
+
+  const obsRows = db
+    .prepare(
+      `select e.id as escola_id, q.observacao
+       from quadros q
+       join escolas e on e.id = q.escola_id
+       where e.em_carencias = 1
+         and q.observacao is not null
+         and trim(q.observacao) != ''
+       order by e.nome collate nocase, q.turma_codigo collate nocase`,
+    )
+    .all() as Array<{ escola_id: string; observacao: string }>;
+
+  type Contagem = {
+    real: number;
+    temporaria: number;
+    he_real: number;
+    he_temporaria: number;
+  };
+  const empty = (): Contagem => ({
+    real: 0,
+    temporaria: 0,
+    he_real: 0,
+    he_temporaria: 0,
+  });
+  const totalOf = (c: Contagem) =>
+    c.real + c.temporaria + c.he_real + c.he_temporaria;
+
+  const discKey = (id: string, codigo: string, nome: string) =>
+    id || `__${codigo}|${nome}`;
+
+  const disciplinas = discRows.map((d) => ({
+    key: discKey(d.id, d.codigo, d.nome),
+    disciplina_id: d.id,
+    codigo: d.codigo,
+    nome: d.nome,
+  }));
+
+  const escolasMap = new Map<
+    string,
+    {
+      escola_id: string;
+      escola_nome: string;
+      por_disciplina: Record<string, Contagem>;
+      total: Contagem;
+      observacoes: string[];
+    }
+  >();
+
+  for (const row of slotRows) {
+    const key = discKey(row.disciplina_id, row.codigo, row.disciplina_nome);
+    let escola = escolasMap.get(row.escola_id);
+    if (!escola) {
+      escola = {
+        escola_id: row.escola_id,
+        escola_nome: row.escola_nome,
+        por_disciplina: {},
+        total: empty(),
+        observacoes: [],
+      };
+      escolasMap.set(row.escola_id, escola);
+    }
+    const cont = escola.por_disciplina[key] ?? empty();
+    const aberto = row.matricula == null;
+    const isHE = row.modalidade_cobertura === "HORA_EXTRA" && !aberto;
+    const isTemp = String(row.tipo).toUpperCase() === "TEMPORARIA";
+
+    if (aberto) {
+      if (isTemp) cont.temporaria += 1;
+      else cont.real += 1;
+    } else if (isHE) {
+      if (isTemp) cont.he_temporaria += 1;
+      else cont.he_real += 1;
+    }
+
+    escola.por_disciplina[key] = cont;
+  }
+
+  for (const row of obsRows) {
+    const escola = escolasMap.get(row.escola_id);
+    if (!escola) continue;
+    const txt = String(row.observacao).trim();
+    if (txt && !escola.observacoes.includes(txt)) {
+      escola.observacoes.push(txt);
+    }
+  }
+
+  for (const escola of escolasMap.values()) {
+    const t = empty();
+    for (const cont of Object.values(escola.por_disciplina)) {
+      t.real += cont.real;
+      t.temporaria += cont.temporaria;
+      t.he_real += cont.he_real;
+      t.he_temporaria += cont.he_temporaria;
+    }
+    escola.total = t;
+  }
+
+  const escolas = [...escolasMap.values()]
+    .filter((e) => totalOf(e.total) > 0)
+    .sort((a, b) => a.escola_nome.localeCompare(b.escola_nome, "pt-BR"))
+    .map((e, idx) => ({
+      n: idx + 1,
+      escola_id: e.escola_id,
+      escola_nome: e.escola_nome,
+      por_disciplina: e.por_disciplina,
+      total: e.total,
+      total_geral: totalOf(e.total),
+      observacoes: e.observacoes.join(" · "),
+    }));
+
+  const totais = empty();
+  for (const e of escolas) {
+    totais.real += e.total.real;
+    totais.temporaria += e.total.temporaria;
+    totais.he_real += e.total.he_real;
+    totais.he_temporaria += e.total.he_temporaria;
+  }
+
+  const totais_por_disciplina: Record<string, Contagem> = {};
+  for (const d of disciplinas) {
+    const cont = empty();
+    for (const e of escolas) {
+      const c = e.por_disciplina[d.key] ?? empty();
+      cont.real += c.real;
+      cont.temporaria += c.temporaria;
+      cont.he_real += c.he_real;
+      cont.he_temporaria += c.he_temporaria;
+    }
+    totais_por_disciplina[d.key] = cont;
+  }
+
+  res.json({
+    disciplinas,
+    escolas,
+    totais,
+    totais_por_disciplina,
+    total_geral: totalOf(totais),
+  });
+});
+
+/** Resumo de carências agrupado por disciplina (com lista de quadros). */
+apiRouter.get("/carencias/disciplinas-resumo", (_req, res) => {
+  const rows = db
+    .prepare(
+      `select
+         coalesce(d.id, '') as disciplina_id,
+         coalesce(nullif(trim(d.codigo), ''), '—') as codigo,
+         coalesce(d.nome, '(sem matéria)') as nome,
+         e.id as escola_id,
+         e.nome as escola_nome,
+         q.id as quadro_id,
+         q.turma_codigo,
+         q.turmas_json,
+         q.turno,
+         (select count(*) from quadro_slots s where s.quadro_id = q.id) as total_slots,
+         (select count(*) from quadro_slots s where s.quadro_id = q.id and s.matricula is null) as abertos
+       from quadros q
+       join escolas e on e.id = q.escola_id
+       left join disciplinas d on d.id = q.disciplina_id
+       where e.em_carencias = 1
+       order by nome collate nocase, escola_nome collate nocase, q.turno, q.turma_codigo collate nocase`,
+    )
+    .all() as Array<{
+    disciplina_id: string;
+    codigo: string;
+    nome: string;
+    escola_id: string;
+    escola_nome: string;
+    quadro_id: string;
+    turma_codigo: string;
+    turmas_json: string | null;
+    turno: string;
+    total_slots: number;
+    abertos: number;
+  }>;
+
+  const slotsStmt = db.prepare(
+    `select dia, periodo, matricula, tipo, turma_codigo, modalidade_cobertura, titular_matricula
+     from quadro_slots where quadro_id = ?`,
+  );
+
+  const map = new Map<
+    string,
+    {
+      disciplina_id: string;
+      codigo: string;
+      nome: string;
+      quadros: number;
+      abertos: number;
+      escolas_count: number;
+      escola_ids: Set<string>;
+      itens: Array<{
+        id: string;
+        escola_id: string;
+        escola_nome: string;
+        turma_codigo: string;
+        turmas: string[];
+        turno: string;
+        total_slots: number;
+        slots_abertos: number;
+        slots_preview: unknown[];
+      }>;
+    }
+  >();
+
+  for (const row of rows) {
+    const key = row.disciplina_id || `__${row.codigo}|${row.nome}`;
+    let disc = map.get(key);
+    if (!disc) {
+      disc = {
+        disciplina_id: row.disciplina_id,
+        codigo: row.codigo,
+        nome: row.nome,
+        quadros: 0,
+        abertos: 0,
+        escolas_count: 0,
+        escola_ids: new Set(),
+        itens: [],
+      };
+      map.set(key, disc);
+    }
+    disc.quadros += 1;
+    disc.abertos += Number(row.abertos);
+    disc.escola_ids.add(row.escola_id);
+    disc.itens.push({
+      id: row.quadro_id,
+      escola_id: row.escola_id,
+      escola_nome: row.escola_nome,
+      turma_codigo: row.turma_codigo,
+      turmas: parseTurmasJson(row.turmas_json, row.turma_codigo),
+      turno: row.turno,
+      total_slots: Number(row.total_slots),
+      slots_abertos: Number(row.abertos),
+      slots_preview: slotsStmt.all(row.quadro_id),
+    });
+  }
+
+  const disciplinas = [...map.values()]
+    .map(({ escola_ids, ...d }) => ({
+      ...d,
+      escolas_count: escola_ids.size,
+      itens: d.itens.sort(
+        (a, b) =>
+          a.escola_nome.localeCompare(b.escola_nome, "pt-BR") ||
+          a.turma_codigo.localeCompare(b.turma_codigo, "pt-BR") ||
+          a.turno.localeCompare(b.turno, "pt-BR"),
+      ),
+    }))
+    .sort(
+      (a, b) =>
+        b.abertos - a.abertos || a.nome.localeCompare(b.nome, "pt-BR"),
+    );
+
+  res.json(disciplinas);
+});
+
+/** Retorna professores que estão alocados em quadros de carências, com suas escolas. */
+apiRouter.get("/carencias/professores-alocados", (_req, res) => {
+  const rows = db
+    .prepare(
+      `select distinct
+         p.matricula,
+         p.nome,
+         p.cargo,
+         p.funcao,
+         e.id as escola_id,
+         e.nome as escola_nome,
+         q.id as quadro_id
+       from quadro_slots s
+       join quadros q on q.id = s.quadro_id
+       join escolas e on e.id = q.escola_id
+       join professores p on p.matricula = s.matricula
+       where e.em_carencias = 1
+         and s.matricula is not null
+       order by p.nome collate nocase, e.nome collate nocase`,
+    )
+    .all() as Array<{
+    matricula: string;
+    nome: string;
+    cargo: string | null;
+    funcao: string | null;
+    escola_id: string;
+    escola_nome: string;
+    quadro_id: string;
+  }>;
+
+  const map = new Map<
+    string,
+    {
+      matricula: string;
+      nome: string;
+      cargo: string | null;
+      funcao: string | null;
+      escolas: Array<{ escola_id: string; escola_nome: string; quadro_ids: string[] }>;
+    }
+  >();
+
+  for (const row of rows) {
+    let prof = map.get(row.matricula);
+    if (!prof) {
+      prof = {
+        matricula: row.matricula,
+        nome: row.nome,
+        cargo: row.cargo,
+        funcao: row.funcao,
+        escolas: [],
+      };
+      map.set(row.matricula, prof);
+    }
+    let escola = prof.escolas.find((e) => e.escola_id === row.escola_id);
+    if (!escola) {
+      escola = { escola_id: row.escola_id, escola_nome: row.escola_nome, quadro_ids: [] };
+      prof.escolas.push(escola);
+    }
+    if (!escola.quadro_ids.includes(row.quadro_id)) {
+      escola.quadro_ids.push(row.quadro_id);
+    }
+  }
+
+  res.json([...map.values()]);
+});
+
+/**
+ * Importa carências a partir de itens já parseados da planilha visual.
+ * Cria UM quadro por escola+turno+disciplina com várias turmas;
+ * horários em conflito (mesma célula, turmas diferentes) vão para
+ * quadro residual só daquela turma.
  */
 apiRouter.post("/carencias/import", (req, res) => {
   const itens = Array.isArray(req.body?.itens) ? req.body.itens : null;
@@ -922,7 +1401,7 @@ apiRouter.post("/carencias/import", (req, res) => {
     "select id from disciplinas where codigo = ? collate nocase",
   );
   const findQuadro = db.prepare(
-    `select id from quadros
+    `select id, turmas_json, turma_codigo from quadros
      where escola_id = ? and turma_codigo = ? collate nocase and turno = ?
        and (
          (? is null and disciplina_id is null)
@@ -930,19 +1409,21 @@ apiRouter.post("/carencias/import", (req, res) => {
        )`,
   );
   const insertQuadro = db.prepare(
-    `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao)
-     values (?, ?, ?, ?, ?, ?)`,
+    `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
+     values (?, ?, ?, ?, ?, ?, ?)`,
   );
-  const updateObs = db.prepare(
-    `update quadros set observacao = coalesce(nullif(observacao, ''), ?),
-     updated_at = datetime('now') where id = ?`,
+  const updateQuadroMeta = db.prepare(
+    `update quadros set turmas_json = ?, turma_codigo = ?,
+       observacao = coalesce(nullif(observacao, ''), ?),
+       updated_at = datetime('now') where id = ?`,
   );
   const findSlot = db.prepare(
-    "select id from quadro_slots where quadro_id = ? and dia = ? and periodo = ?",
+    `select id, turma_codigo from quadro_slots
+     where quadro_id = ? and dia = ? and periodo = ?`,
   );
   const insertSlot = db.prepare(
-    `insert into quadro_slots (id, quadro_id, dia, periodo, tipo, expira_em)
-     values (?, ?, ?, ?, 'REAL', null)`,
+    `insert into quadro_slots (id, quadro_id, dia, periodo, tipo, expira_em, turma_codigo)
+     values (?, ?, ?, ?, 'REAL', null, ?)`,
   );
 
   let escolas_criadas = 0;
@@ -950,11 +1431,11 @@ apiRouter.post("/carencias/import", (req, res) => {
   let quadros_criados = 0;
   let slots_criados = 0;
   let slots_existentes = 0;
+  let slots_conflito = 0;
   let ignorados = 0;
   const erros: string[] = [];
   const escolaCache = new Map<string, string>();
   const discCache = new Map<string, string | null>();
-  const quadroCache = new Map<string, string>();
 
   function resolveDisc(codigoRaw: string): string | null {
     let codigo = String(codigoRaw || "PT").trim().toUpperCase();
@@ -963,9 +1444,7 @@ apiRouter.post("/carencias/import", (req, res) => {
     const row = findDisc.get(codigo) as { id: string } | undefined;
     const id = row?.id ?? null;
     discCache.set(codigo, id);
-    if (!id) {
-      erros.push(`Disciplina não cadastrada: ${codigo}`);
-    }
+    if (!id) erros.push(`Disciplina não cadastrada: ${codigo}`);
     return id;
   }
 
@@ -991,19 +1470,76 @@ apiRouter.post("/carencias/import", (req, res) => {
     return id;
   }
 
+  function ensureQuadro(
+    escola_id: string,
+    turno: string,
+    disciplina_id: string | null,
+    turmas: string[],
+    observacao: string | null,
+  ): string {
+    const label = turmaLabel(turmas);
+    const turmas_json = JSON.stringify(turmas);
+    const existing = findQuadro.get(
+      escola_id,
+      label,
+      turno,
+      disciplina_id,
+      disciplina_id,
+    ) as
+      | { id: string; turmas_json: string | null; turma_codigo: string }
+      | undefined;
+    if (existing) {
+      const merged = normalizeTurmas([
+        ...parseTurmasJson(existing.turmas_json, existing.turma_codigo),
+        ...turmas,
+      ]);
+      updateQuadroMeta.run(
+        JSON.stringify(merged),
+        turmaLabel(merged),
+        observacao,
+        existing.id,
+      );
+      return existing.id;
+    }
+    const id = uuid();
+    insertQuadro.run(
+      id,
+      escola_id,
+      label,
+      turno,
+      disciplina_id,
+      observacao,
+      turmas_json,
+    );
+    quadros_criados += 1;
+    return id;
+  }
+
+  type ItemOk = {
+    escola_id: string;
+    turma: string;
+    turno: string;
+    dia: number;
+    periodo: number;
+    disciplina_id: string | null;
+    observacao: string | null;
+  };
+
   try {
     db.exec("BEGIN");
+
+    const ok: ItemOk[] = [];
     for (let i = 0; i < itens.length; i++) {
       const raw = itens[i];
       const escola = String(raw?.escola ?? "").trim();
-      const turma_codigo = String(raw?.turma_codigo ?? "").trim();
+      const turma = String(raw?.turma_codigo ?? "").trim();
       const turno = String(raw?.turno ?? "").trim().toUpperCase();
       const dia = Number(raw?.dia);
       const periodo = Number(raw?.periodo);
       const disciplina_codigo = String(raw?.disciplina_codigo ?? "PT").trim();
       const observacao = String(raw?.observacao ?? "").trim() || null;
 
-      if (!escola || !turma_codigo) {
+      if (!escola || !turma) {
         ignorados += 1;
         erros.push(`Linha ${i + 1}: escola e turma são obrigatórios`);
         continue;
@@ -1030,45 +1566,107 @@ apiRouter.post("/carencias/import", (req, res) => {
         continue;
       }
 
-      const disciplina_id = resolveDisc(disciplina_codigo);
-      const qKey = `${escola_id}|${turma_codigo.toLowerCase()}|${turno}|${disciplina_id ?? "null"}`;
-      let quadro_id = quadroCache.get(qKey);
-      if (!quadro_id) {
-        const existing = findQuadro.get(
-          escola_id,
-          turma_codigo,
-          turno,
-          disciplina_id,
-          disciplina_id,
-        ) as { id: string } | undefined;
-        if (existing) {
-          quadro_id = existing.id;
-          if (observacao) updateObs.run(observacao, quadro_id);
-        } else {
-          quadro_id = uuid();
-          insertQuadro.run(
-            quadro_id,
-            escola_id,
-            turma_codigo,
-            turno,
-            disciplina_id,
-            observacao,
-          );
-          quadros_criados += 1;
-        }
-        quadroCache.set(qKey, quadro_id);
+      ok.push({
+        escola_id,
+        turma,
+        turno,
+        dia,
+        periodo,
+        disciplina_id: resolveDisc(disciplina_codigo),
+        observacao,
+      });
+    }
+
+    type Grupo = {
+      escola_id: string;
+      turno: string;
+      disciplina_id: string | null;
+      turmas: Set<string>;
+      obs: string | null;
+      itens: ItemOk[];
+    };
+    const grupos = new Map<string, Grupo>();
+    for (const it of ok) {
+      const key = `${it.escola_id}|${it.turno}|${it.disciplina_id ?? "null"}`;
+      let g = grupos.get(key);
+      if (!g) {
+        g = {
+          escola_id: it.escola_id,
+          turno: it.turno,
+          disciplina_id: it.disciplina_id,
+          turmas: new Set(),
+          obs: it.observacao,
+          itens: [],
+        };
+        grupos.set(key, g);
+      }
+      g.turmas.add(it.turma);
+      g.itens.push(it);
+      if (!g.obs && it.observacao) g.obs = it.observacao;
+    }
+
+    for (const g of grupos.values()) {
+      const turmas = normalizeTurmas([...g.turmas]);
+      const quadroId = ensureQuadro(
+        g.escola_id,
+        g.turno,
+        g.disciplina_id,
+        turmas,
+        g.obs,
+      );
+
+      // célula → turma já colocada no quadro principal
+      const ocupado = new Map<string, string>();
+      for (const s of db
+        .prepare(
+          `select dia, periodo, turma_codigo from quadro_slots where quadro_id = ?`,
+        )
+        .all(quadroId) as Array<{
+        dia: number;
+        periodo: number;
+        turma_codigo: string | null;
+      }>) {
+        ocupado.set(
+          `${s.dia}:${s.periodo}`,
+          String(s.turma_codigo || turmas[0] || ""),
+        );
       }
 
-      const slot = findSlot.get(quadro_id, dia, periodo) as
-        | { id: string }
-        | undefined;
-      if (slot) {
-        slots_existentes += 1;
-      } else {
-        insertSlot.run(uuid(), quadro_id, dia, periodo);
-        slots_criados += 1;
+      for (const it of g.itens) {
+        const cell = `${it.dia}:${it.periodo}`;
+        const dono = ocupado.get(cell);
+        if (!dono) {
+          insertSlot.run(uuid(), quadroId, it.dia, it.periodo, it.turma);
+          ocupado.set(cell, it.turma);
+          slots_criados += 1;
+          continue;
+        }
+        if (dono.toUpperCase() === it.turma.toUpperCase()) {
+          slots_existentes += 1;
+          continue;
+        }
+
+        // Conflito: mesmo horário, outra turma → quadro residual só dessa turma
+        const residualId = ensureQuadro(
+          g.escola_id,
+          g.turno,
+          g.disciplina_id,
+          [it.turma],
+          it.observacao,
+        );
+        const slotRes = findSlot.get(residualId, it.dia, it.periodo) as
+          | { id: string }
+          | undefined;
+        if (slotRes) {
+          slots_existentes += 1;
+        } else {
+          insertSlot.run(uuid(), residualId, it.dia, it.periodo, it.turma);
+          slots_criados += 1;
+          slots_conflito += 1;
+        }
       }
     }
+
     db.exec("COMMIT");
   } catch (err) {
     try {
@@ -1087,6 +1685,7 @@ apiRouter.post("/carencias/import", (req, res) => {
     quadros_criados,
     slots_criados,
     slots_existentes,
+    slots_conflito,
     ignorados,
     erros: [...new Set(erros)].slice(0, 50),
   });
@@ -1296,8 +1895,9 @@ apiRouter.get("/horas-extra", (req, res) => {
     return res.json(
       db
         .prepare(
-          `select h.*, p.nome as professor_nome, p.cargo as professor_cargo,
-                  p.funcao as professor_funcao,
+          `select h.*, p.nome as professor_nome,
+                  coalesce(h.cargo, p.cargo) as professor_cargo,
+                  coalesce(h.funcao, p.funcao) as professor_funcao,
                   d.nome as disciplina_nome, d.codigo as disciplina_codigo
            ${baseFrom}${where}
            order by h.created_at desc`,
@@ -1314,8 +1914,9 @@ apiRouter.get("/horas-extra", (req, res) => {
 
   const items = db
     .prepare(
-      `select h.*, p.nome as professor_nome, p.cargo as professor_cargo,
-              p.funcao as professor_funcao,
+      `select h.*, p.nome as professor_nome,
+              coalesce(h.cargo, p.cargo) as professor_cargo,
+              coalesce(h.funcao, p.funcao) as professor_funcao,
               d.nome as disciplina_nome, d.codigo as disciplina_codigo
        ${baseFrom}${where}
        order by h.created_at desc
@@ -1347,26 +1948,21 @@ apiRouter.post("/horas-extra", (req, res) => {
 
   const id = uuid();
   try {
+    // Garante que o professor exista (só cria se não existir, sem atualizar)
     const exists = db
       .prepare("select matricula from professores where matricula = ?")
       .get(matricula);
-    if (exists) {
+    if (!exists) {
       db.prepare(
-        `update professores set
-           nome = ?, cargo = coalesce(?, cargo), funcao = coalesce(?, funcao),
-           updated_at = datetime('now')
-         where matricula = ?`,
-      ).run(nome, cargo, funcao, matricula);
-    } else {
-      db.prepare(
-        `insert into professores (matricula, nome, cargo, funcao) values (?, ?, ?, ?)`,
-      ).run(matricula, nome, cargo, funcao);
+        `insert into professores (matricula, nome) values (?, ?)`,
+      ).run(matricula, nome);
     }
 
+    // Cargo/função ficam na HE, não alteram o professor
     db.prepare(
       `insert into horas_extra
-       (id, matricula, disciplina_id, tempos_autorizados, tipo, inicio, termino, memo, observacao, lotacao_origem, unidade)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, matricula, disciplina_id, tempos_autorizados, tipo, inicio, termino, memo, observacao, lotacao_origem, unidade, cargo, funcao)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       matricula,
@@ -1379,6 +1975,8 @@ apiRouter.post("/horas-extra", (req, res) => {
       String(req.body?.observacao ?? "").trim() || null,
       String(req.body?.lotacao_origem ?? "").trim() || null,
       unidade,
+      cargo,
+      funcao,
     );
     return res.status(201).json(
       db.prepare("select * from horas_extra where id = ?").get(id),
@@ -1400,20 +1998,12 @@ apiRouter.post("/horas-extra/import", (req, res) => {
     "select matricula from professores where matricula = ?",
   );
   const insertProf = db.prepare(
-    `insert into professores (matricula, nome, cargo, funcao) values (?, ?, ?, ?)`,
-  );
-  const updateProf = db.prepare(
-    `update professores set
-       nome = coalesce(?, nome),
-       cargo = coalesce(?, cargo),
-       funcao = coalesce(?, funcao),
-       updated_at = datetime('now')
-     where matricula = ?`,
+    `insert into professores (matricula, nome) values (?, ?)`,
   );
   const insertHe = db.prepare(
     `insert into horas_extra
-     (id, matricula, disciplina_id, tempos_autorizados, tipo, inicio, termino, memo, observacao, lotacao_origem, unidade)
-     values (?, ?, null, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     (id, matricula, disciplina_id, tempos_autorizados, tipo, inicio, termino, memo, observacao, lotacao_origem, unidade, cargo, funcao)
+     values (?, ?, null, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
 
   let criados = 0;
@@ -1466,6 +2056,7 @@ apiRouter.post("/horas-extra/import", (req, res) => {
         continue;
       }
 
+      // Garante que o professor exista (só cria se não existir, sem atualizar cargo/funcao)
       const exists = findProf.get(matricula);
       if (!exists) {
         if (!nome) {
@@ -1475,11 +2066,10 @@ apiRouter.post("/horas-extra/import", (req, res) => {
           );
           continue;
         }
-        insertProf.run(matricula, nome, cargo, funcao);
-      } else if (nome || cargo || funcao) {
-        updateProf.run(nome, cargo, funcao, matricula);
+        insertProf.run(matricula, nome);
       }
 
+      // Cargo/função ficam na HE, não alteram o professor
       insertHe.run(
         uuid(),
         matricula,
@@ -1491,6 +2081,8 @@ apiRouter.post("/horas-extra/import", (req, res) => {
         observacao,
         lotacao,
         unidade,
+        cargo,
+        funcao,
       );
       criados += 1;
     }
@@ -1529,28 +2121,23 @@ apiRouter.put("/horas-extra/:id", (req, res) => {
   }
 
   try {
+    // Garante que o professor exista (só cria se não existir, sem atualizar)
     const exists = db
       .prepare("select matricula from professores where matricula = ?")
       .get(matricula);
-    if (exists) {
+    if (!exists) {
       db.prepare(
-        `update professores set
-           nome = ?, cargo = coalesce(?, cargo), funcao = coalesce(?, funcao),
-           updated_at = datetime('now')
-         where matricula = ?`,
-      ).run(nome, cargo, funcao, matricula);
-    } else {
-      db.prepare(
-        `insert into professores (matricula, nome, cargo, funcao) values (?, ?, ?, ?)`,
-      ).run(matricula, nome, cargo, funcao);
+        `insert into professores (matricula, nome) values (?, ?)`,
+      ).run(matricula, nome);
     }
 
+    // Cargo/função ficam na HE, não alteram o professor
     const result = db
       .prepare(
         `update horas_extra set
           matricula = ?, disciplina_id = ?, tempos_autorizados = ?, tipo = ?,
           inicio = ?, termino = ?, memo = ?, observacao = ?, lotacao_origem = ?,
-          unidade = ?, updated_at = datetime('now')
+          unidade = ?, cargo = ?, funcao = ?, updated_at = datetime('now')
          where id = ?`,
       )
       .run(
@@ -1564,6 +2151,8 @@ apiRouter.put("/horas-extra/:id", (req, res) => {
         String(req.body?.observacao ?? "").trim() || null,
         String(req.body?.lotacao_origem ?? "").trim() || null,
         unidade,
+        cargo,
+        funcao,
         req.params.id,
       );
     if (result.changes === 0) {
@@ -1710,11 +2299,12 @@ apiRouter.get("/escolas/:id/quadros", (req, res) => {
     .all(req.params.id) as Array<Record<string, unknown> & { id: string }>;
 
   const slotsStmt = db.prepare(
-    `select dia, periodo, matricula, tipo from quadro_slots where quadro_id = ?`,
+    `select dia, periodo, matricula, tipo, turma_codigo, modalidade_cobertura, titular_matricula
+     from quadro_slots where quadro_id = ?`,
   );
 
   const comPreview = quadros.map((q) => ({
-    ...q,
+    ...hydrateQuadroRow(q),
     slots_preview: slotsStmt.all(q.id),
   }));
 
@@ -1726,46 +2316,71 @@ apiRouter.post("/escolas/:id/quadros", (req, res) => {
   const escola = db.prepare("select id from escolas where id = ?").get(escola_id);
   if (!escola) return res.status(404).json({ error: "Escola não encontrada" });
 
-  const turma_codigo = String(req.body?.turma_codigo ?? "").trim();
+  const turmasBody = Array.isArray(req.body?.turmas) ? req.body.turmas : null;
+  const turmas = normalizeTurmas(
+    turmasBody ?? [String(req.body?.turma_codigo ?? "").trim()],
+  );
   const turno = String(req.body?.turno ?? "");
   const disciplina_id = req.body?.disciplina_id || null;
   const observacao = String(req.body?.observacao ?? "").trim() || null;
 
-  if (!turma_codigo) {
-    return res.status(400).json({ error: "Informe o código da turma" });
+  if (turmas.length === 0) {
+    return res.status(400).json({ error: "Informe ao menos uma turma" });
   }
   if (!["MANHA", "TARDE", "NOITE"].includes(turno)) {
     return res.status(400).json({ error: "Turno inválido" });
   }
 
+  const turma_codigo = turmaLabel(turmas);
+  const turmas_json = JSON.stringify(turmas);
   const id = uuid();
   try {
     db.prepare(
-      `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao)
-       values (?, ?, ?, ?, ?, ?)`,
-    ).run(id, escola_id, turma_codigo, turno, disciplina_id, observacao);
+      `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
+       values (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      escola_id,
+      turma_codigo,
+      turno,
+      disciplina_id,
+      observacao,
+      turmas_json,
+    );
   } catch {
     return res
       .status(409)
       .json({
         error:
-          "Já existe quadro para esta turma, turno e disciplina nesta escola",
+          "Já existe quadro para estas turmas, turno e disciplina nesta escola",
       });
   }
 
   return res.status(201).json(
-    db.prepare("select * from quadros where id = ?").get(id),
+    hydrateQuadroRow(
+      db.prepare("select * from quadros where id = ?").get(id) as Record<
+        string,
+        unknown
+      >,
+    ),
   );
 });
 
 apiRouter.put("/quadros/:id", (req, res) => {
-  const turma_codigo = String(req.body?.turma_codigo ?? "").trim();
+  const turmasRaw = req.body?.turmas;
+  const turmas: string[] = Array.isArray(turmasRaw)
+    ? turmasRaw.map((t: unknown) => String(t).trim()).filter(Boolean)
+    : [];
+  const turma_codigo_legacy = String(req.body?.turma_codigo ?? "").trim();
   const turno = String(req.body?.turno ?? "");
   const disciplina_id = req.body?.disciplina_id || null;
   const observacao = String(req.body?.observacao ?? "").trim() || null;
 
+  const turma_codigo = turmas.length > 0 ? turmas[0] : turma_codigo_legacy;
+  const turmas_json = turmas.length > 0 ? JSON.stringify(turmas) : null;
+
   if (!turma_codigo) {
-    return res.status(400).json({ error: "Informe o código da turma" });
+    return res.status(400).json({ error: "Informe ao menos uma turma" });
   }
   if (!["MANHA", "TARDE", "NOITE"].includes(turno)) {
     return res.status(400).json({ error: "Turno inválido" });
@@ -1775,10 +2390,10 @@ apiRouter.put("/quadros/:id", (req, res) => {
     const result = db
       .prepare(
         `update quadros set turma_codigo = ?, turno = ?, disciplina_id = ?,
-         observacao = ?, updated_at = datetime('now')
+         observacao = ?, turmas_json = ?, updated_at = datetime('now')
          where id = ?`,
       )
-      .run(turma_codigo, turno, disciplina_id, observacao, req.params.id);
+      .run(turma_codigo, turno, disciplina_id, observacao, turmas_json, req.params.id);
     if (result.changes === 0) {
       return res.status(404).json({ error: "Quadro não encontrado" });
     }
@@ -1799,11 +2414,12 @@ apiRouter.delete("/quadros/:id", (req, res) => {
   if (result.changes === 0) {
     return res.status(404).json({ error: "Quadro não encontrado" });
   }
+  invalidateCarenciasContagensCache();
   return res.status(204).send();
 });
 
 apiRouter.get("/quadros/:id", (req, res) => {
-  const quadro = db
+  const row = db
     .prepare(
       `select q.*, e.nome as escola_nome,
               d.nome as disciplina_nome, d.codigo as disciplina_codigo
@@ -1812,57 +2428,28 @@ apiRouter.get("/quadros/:id", (req, res) => {
        left join disciplinas d on d.id = q.disciplina_id
        where q.id = ?`,
     )
-    .get(req.params.id) as
-    | {
-        id: string;
-        escola_id: string;
-        turno: string;
-        disciplina_id: string | null;
-      }
-    | undefined;
-  if (!quadro) return res.status(404).json({ error: "Quadro não encontrado" });
+    .get(req.params.id) as Record<string, unknown> | undefined;
+  if (!row) return res.status(404).json({ error: "Quadro não encontrado" });
 
-  const slotsStmt = db.prepare(
-    `select s.*, p.nome as professor_nome
-     from quadro_slots s
-     left join professores p on p.matricula = s.matricula
-     where s.quadro_id = ?
-     order by s.dia, s.periodo`,
-  );
-
-  const slots = slotsStmt.all(req.params.id);
-
-  // Mesmo turno + disciplina = grupo editável junto (várias turmas na grade)
-  const irmaos = db
+  const quadro = hydrateQuadroRow(row);
+  const slots = db
     .prepare(
-      `select q.*, e.nome as escola_nome,
-              d.nome as disciplina_nome, d.codigo as disciplina_codigo
-       from quadros q
-       join escolas e on e.id = q.escola_id
-       left join disciplinas d on d.id = q.disciplina_id
-       where q.escola_id = ? and q.turno = ?
-         and (
-           (? is null and q.disciplina_id is null)
-           or q.disciplina_id = ?
-         )
-       order by q.turma_codigo collate nocase`,
+      `select s.*, p.nome as professor_nome, pt.nome as titular_nome
+       from quadro_slots s
+       left join professores p on p.matricula = s.matricula
+       left join professores pt on pt.matricula = s.titular_matricula
+       where s.quadro_id = ?
+       order by s.dia, s.periodo`,
     )
-    .all(
-      quadro.escola_id,
-      quadro.turno,
-      quadro.disciplina_id,
-      quadro.disciplina_id,
-    ) as Array<Record<string, unknown> & { id: string; turma_codigo: string }>;
+    .all(req.params.id);
 
-  const grupo = irmaos.map((q) => ({
-    quadro: q,
-    slots: slotsStmt.all(q.id),
-  }));
-
-  res.json({ quadro, slots, grupo });
+  res.json({ quadro, slots });
 });
 
-/** Cria vários quadros de uma vez (mesmo turno/disciplina, várias turmas). */
+/**
+ * Cria UM quadro com várias turmas (mesmo turno/disciplina).
+ * Mantém a rota /lote por compatibilidade com a UI.
+ */
 apiRouter.post("/escolas/:id/quadros/lote", (req, res) => {
   const escola_id = req.params.id;
   const escola = db.prepare("select id from escolas where id = ?").get(escola_id);
@@ -1871,14 +2458,9 @@ apiRouter.post("/escolas/:id/quadros/lote", (req, res) => {
   const turno = String(req.body?.turno ?? "");
   const disciplina_id = req.body?.disciplina_id || null;
   const observacao = String(req.body?.observacao ?? "").trim() || null;
-  const turmasRaw = Array.isArray(req.body?.turmas) ? req.body.turmas : [];
-  const turmas = [
-    ...new Set(
-      turmasRaw
-        .map((t: unknown) => String(t ?? "").trim())
-        .filter(Boolean),
-    ),
-  ];
+  const turmas = normalizeTurmas(
+    Array.isArray(req.body?.turmas) ? req.body.turmas : [],
+  );
 
   if (turmas.length === 0) {
     return res.status(400).json({ error: "Informe ao menos uma turma" });
@@ -1887,67 +2469,51 @@ apiRouter.post("/escolas/:id/quadros/lote", (req, res) => {
     return res.status(400).json({ error: "Turno inválido" });
   }
 
-  const insert = db.prepare(
-    `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao)
-     values (?, ?, ?, ?, ?, ?)`,
-  );
-
-  const criados: unknown[] = [];
-  const ignorados: string[] = [];
-  const erros: string[] = [];
+  const turma_codigo = turmaLabel(turmas);
+  const turmas_json = JSON.stringify(turmas);
+  const id = uuid();
 
   try {
-    db.exec("BEGIN");
-    for (const turma_codigo of turmas) {
-      const id = uuid();
-      try {
-        insert.run(
-          id,
-          escola_id,
-          turma_codigo,
-          turno,
-          disciplina_id,
-          observacao,
-        );
-        criados.push(
-          db.prepare("select * from quadros where id = ?").get(id),
-        );
-      } catch {
-        ignorados.push(turma_codigo);
-        erros.push(
-          `Turma ${turma_codigo}: já existe neste turno/disciplina`,
-        );
-      }
-    }
-    db.exec("COMMIT");
-  } catch (err) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      /* ignore */
-    }
-    return res.status(500).json({
-      error: err instanceof Error ? err.message : "Erro ao criar quadros",
+    db.prepare(
+      `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
+       values (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      escola_id,
+      turma_codigo,
+      turno,
+      disciplina_id,
+      observacao,
+      turmas_json,
+    );
+  } catch {
+    return res.status(409).json({
+      error:
+        "Já existe quadro para estas turmas, turno e disciplina nesta escola",
+      ignorados: turmas,
+      erros: [
+        "Já existe quadro para estas turmas, turno e disciplina nesta escola",
+      ],
     });
   }
 
-  if (criados.length === 0) {
-    return res.status(409).json({
-      error: erros[0] ?? "Nenhum quadro criado",
-      ignorados,
-      erros,
-    });
-  }
+  const criado = hydrateQuadroRow(
+    db.prepare("select * from quadros where id = ?").get(id) as Record<
+      string,
+      unknown
+    >,
+  );
 
   return res.status(201).json({
-    criados,
-    ignorados,
-    erros,
+    criados: [criado],
+    ignorados: [],
+    erros: [],
   });
 });
 
 /** Liga/desliga carência no horário (célula do quadro da turma). */
 apiRouter.put("/quadros/:id/slots", (req, res) => {
+  invalidateCarenciasContagensCache();
   const quadro_id = req.params.id;
   const dia = Number(req.body?.dia);
   const periodo = Number(req.body?.periodo);
@@ -1957,6 +2523,9 @@ apiRouter.put("/quadros/:id/slots", (req, res) => {
       ? "TEMPORARIA"
       : "REAL";
   let expira_em: string | null = null;
+  const modalidadeRaw = String(req.body?.modalidade_cobertura ?? "").toUpperCase();
+  const modalidade_cobertura: string | null =
+    modalidadeRaw === "NORMAL" || modalidadeRaw === "HORA_EXTRA" ? modalidadeRaw : null;
 
   if (!Number.isInteger(dia) || dia < 1 || dia > 5) {
     return res.status(400).json({ error: "Dia inválido" });
@@ -1976,8 +2545,31 @@ apiRouter.put("/quadros/:id/slots", (req, res) => {
     }
   }
 
-  const quadro = db.prepare("select id from quadros where id = ?").get(quadro_id);
+  const quadro = db
+    .prepare("select id, turma_codigo, turmas_json from quadros where id = ?")
+    .get(quadro_id) as
+    | { id: string; turma_codigo: string; turmas_json: string | null }
+    | undefined;
   if (!quadro) return res.status(404).json({ error: "Quadro não encontrado" });
+
+  const turmasDoQuadro = parseTurmasJson(
+    quadro.turmas_json,
+    quadro.turma_codigo,
+  );
+  let turmaSlot = String(req.body?.turma_codigo ?? "").trim();
+  if (ativo) {
+    if (!turmaSlot) {
+      turmaSlot = turmasDoQuadro[0] ?? quadro.turma_codigo;
+    }
+    if (
+      turmasDoQuadro.length > 0 &&
+      !turmasDoQuadro.some((t) => t.toUpperCase() === turmaSlot.toUpperCase())
+    ) {
+      return res.status(400).json({
+        error: `Turma ${turmaSlot} não pertence a este quadro`,
+      });
+    }
+  }
 
   const existing = db
     .prepare(
@@ -1987,6 +2579,15 @@ apiRouter.put("/quadros/:id/slots", (req, res) => {
 
   if (!ativo) {
     if (existing) {
+      const comLicenca = db
+        .prepare("select titular_matricula from quadro_slots where id = ?")
+        .get(existing.id) as { titular_matricula: string | null } | undefined;
+      if (comLicenca?.titular_matricula) {
+        return res.status(400).json({
+          error:
+            "Este horário está em licença. Use “Encerrar licença” para devolver ao titular, ou remova só o substituto com “Tirar”.",
+        });
+      }
       db.prepare("delete from quadro_slots where id = ?").run(existing.id);
     }
     return res.json({ removed: true });
@@ -1995,9 +2596,9 @@ apiRouter.put("/quadros/:id/slots", (req, res) => {
   if (existing) {
     db.prepare(
       `update quadro_slots
-       set tipo = ?, expira_em = ?, updated_at = datetime('now')
+       set tipo = ?, expira_em = ?, turma_codigo = ?, modalidade_cobertura = ?, updated_at = datetime('now')
        where id = ?`,
-    ).run(tipo, expira_em, existing.id);
+    ).run(tipo, expira_em, turmaSlot, modalidade_cobertura, existing.id);
 
     return res.json(
       db
@@ -2013,9 +2614,9 @@ apiRouter.put("/quadros/:id/slots", (req, res) => {
 
   const id = uuid();
   db.prepare(
-    `insert into quadro_slots (id, quadro_id, dia, periodo, tipo, expira_em)
-     values (?, ?, ?, ?, ?, ?)`,
-  ).run(id, quadro_id, dia, periodo, tipo, expira_em);
+    `insert into quadro_slots (id, quadro_id, dia, periodo, tipo, expira_em, turma_codigo, modalidade_cobertura)
+     values (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, quadro_id, dia, periodo, tipo, expira_em, turmaSlot, modalidade_cobertura);
 
   return res.status(201).json(
     db
@@ -2045,30 +2646,192 @@ apiRouter.patch("/quadro-slots/:id/professor", (req, res) => {
     }
   }
 
-  const result = db
-    .prepare(
+  const existing = db
+    .prepare("select id, titular_matricula from quadro_slots where id = ?")
+    .get(req.params.id) as { id: string; titular_matricula: string | null } | undefined;
+  if (!existing) {
+    return res.status(404).json({ error: "Slot não encontrado" });
+  }
+
+  // Em licença: "Tirar" remove só o substituto e mantém a carência aberta
+  if (matricula === null && existing.titular_matricula) {
+    db.prepare(
+      `update quadro_slots
+       set matricula = null, modalidade_cobertura = null, updated_at = datetime('now')
+       where id = ?`,
+    ).run(req.params.id);
+  } else {
+    db.prepare(
       `update quadro_slots set matricula = ?, updated_at = datetime('now')
        where id = ?`,
-    )
-    .run(matricula, req.params.id);
-
-  if (result.changes === 0) {
-    return res.status(404).json({ error: "Slot não encontrado" });
+    ).run(matricula, req.params.id);
   }
 
   return res.json(
     db
       .prepare(
-        `select s.*, p.nome as professor_nome
+        `select s.*, p.nome as professor_nome, pt.nome as titular_nome
          from quadro_slots s
          left join professores p on p.matricula = s.matricula
+         left join professores pt on pt.matricula = s.titular_matricula
          where s.id = ?`,
       )
       .get(req.params.id),
   );
 });
 
+/** Abre licença: guarda titular, libera o horário como carência temporária. */
+apiRouter.post("/quadros/:id/licenca", (req, res) => {
+  const quadro_id = req.params.id;
+  const ate = String(req.body?.ate ?? "").trim();
+  const ids = Array.isArray(req.body?.slot_ids)
+    ? (req.body.slot_ids as unknown[]).map(String)
+    : [];
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ate)) {
+    return res.status(400).json({ error: "Informe a data de retorno (AAAA-MM-DD)" });
+  }
+  if (ids.length === 0) {
+    return res.status(400).json({ error: "Selecione ao menos um horário" });
+  }
+
+  const quadro = db.prepare("select id from quadros where id = ?").get(quadro_id);
+  if (!quadro) return res.status(404).json({ error: "Quadro não encontrado" });
+
+  const getSlot = db.prepare(
+    `select id, matricula, modalidade_cobertura, titular_matricula
+     from quadro_slots where id = ? and quadro_id = ?`,
+  );
+  const upd = db.prepare(
+    `update quadro_slots
+     set titular_matricula = ?,
+         titular_modalidade = ?,
+         matricula = null,
+         modalidade_cobertura = null,
+         tipo = 'TEMPORARIA',
+         expira_em = ?,
+         updated_at = datetime('now')
+     where id = ?`,
+  );
+
+  let updated = 0;
+  const erros: string[] = [];
+  for (const id of ids) {
+    const slot = getSlot.get(id, quadro_id) as
+      | {
+          id: string;
+          matricula: string | null;
+          modalidade_cobertura: string | null;
+          titular_matricula: string | null;
+        }
+      | undefined;
+    if (!slot) {
+      erros.push(`Slot ${id} não encontrado`);
+      continue;
+    }
+    if (slot.titular_matricula) {
+      // Já em licença: só atualiza a data de retorno
+      db.prepare(
+        `update quadro_slots set tipo = 'TEMPORARIA', expira_em = ?, updated_at = datetime('now')
+         where id = ?`,
+      ).run(ate, id);
+      updated += 1;
+      continue;
+    }
+    if (!slot.matricula) {
+      erros.push("Só é possível abrir licença em horário com professor atribuído");
+      continue;
+    }
+    const modalidade =
+      slot.modalidade_cobertura === "NORMAL" || slot.modalidade_cobertura === "HORA_EXTRA"
+        ? slot.modalidade_cobertura
+        : null;
+    upd.run(slot.matricula, modalidade, ate, id);
+    updated += 1;
+  }
+
+  const slots = db
+    .prepare(
+      `select s.*, p.nome as professor_nome, pt.nome as titular_nome
+       from quadro_slots s
+       left join professores p on p.matricula = s.matricula
+       left join professores pt on pt.matricula = s.titular_matricula
+       where s.quadro_id = ?
+       order by s.dia, s.periodo`,
+    )
+    .all(quadro_id);
+
+  return res.json({ updated, erros, slots });
+});
+
+/** Encerra licença: devolve o horário ao titular e remove o substituto. */
+apiRouter.post("/quadros/:id/encerrar-licenca", (req, res) => {
+  const quadro_id = req.params.id;
+  const ids = Array.isArray(req.body?.slot_ids)
+    ? (req.body.slot_ids as unknown[]).map(String)
+    : [];
+
+  if (ids.length === 0) {
+    return res.status(400).json({ error: "Selecione ao menos um horário" });
+  }
+
+  const quadro = db.prepare("select id from quadros where id = ?").get(quadro_id);
+  if (!quadro) return res.status(404).json({ error: "Quadro não encontrado" });
+
+  const getSlot = db.prepare(
+    `select id, titular_matricula, titular_modalidade
+     from quadro_slots where id = ? and quadro_id = ?`,
+  );
+  const upd = db.prepare(
+    `update quadro_slots
+     set matricula = ?,
+         modalidade_cobertura = ?,
+         titular_matricula = null,
+         titular_modalidade = null,
+         tipo = 'REAL',
+         expira_em = null,
+         updated_at = datetime('now')
+     where id = ?`,
+  );
+
+  let updated = 0;
+  const erros: string[] = [];
+  for (const id of ids) {
+    const slot = getSlot.get(id, quadro_id) as
+      | {
+          id: string;
+          titular_matricula: string | null;
+          titular_modalidade: string | null;
+        }
+      | undefined;
+    if (!slot) {
+      erros.push(`Slot ${id} não encontrado`);
+      continue;
+    }
+    if (!slot.titular_matricula) {
+      erros.push("Horário sem licença aberta");
+      continue;
+    }
+    upd.run(slot.titular_matricula, slot.titular_modalidade, id);
+    updated += 1;
+  }
+
+  const slots = db
+    .prepare(
+      `select s.*, p.nome as professor_nome, pt.nome as titular_nome
+       from quadro_slots s
+       left join professores p on p.matricula = s.matricula
+       left join professores pt on pt.matricula = s.titular_matricula
+       where s.quadro_id = ?
+       order by s.dia, s.periodo`,
+    )
+    .all(quadro_id);
+
+  return res.json({ updated, erros, slots });
+});
+
 apiRouter.post("/quadros/:id/atribuir", (req, res) => {
+  invalidateCarenciasContagensCache();
   const quadro_id = req.params.id;
   const matricula = String(req.body?.matricula ?? "").trim();
   const ids = Array.isArray(req.body?.slot_ids)
@@ -2123,6 +2886,311 @@ apiRouter.put("/quadros/:id/observacao", (req, res) => {
   return res.json(db.prepare("select * from quadros where id = ?").get(req.params.id));
 });
 
+apiRouter.post("/quadros/mesclar", (req, res) => {
+  const quadroIds = Array.isArray(req.body?.quadro_ids)
+    ? (req.body.quadro_ids as unknown[]).map(String).filter(Boolean)
+    : [];
+
+  if (quadroIds.length < 2) {
+    return res.status(400).json({ error: "Selecione ao menos 2 quadros para mesclar" });
+  }
+
+  const quadros = db
+    .prepare(
+      `select id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json
+       from quadros where id in (${quadroIds.map(() => "?").join(",")})`,
+    )
+    .all(...quadroIds) as Array<{
+    id: string;
+    escola_id: string;
+    turma_codigo: string;
+    turno: string;
+    disciplina_id: string | null;
+    observacao: string | null;
+    turmas_json: string | null;
+  }>;
+
+  if (quadros.length !== quadroIds.length) {
+    return res.status(400).json({ error: "Um ou mais quadros não foram encontrados" });
+  }
+
+  const turnos = new Set(quadros.map((q) => q.turno));
+  if (turnos.size > 1) {
+    return res.status(400).json({ error: "Não é possível mesclar quadros de turnos diferentes" });
+  }
+
+  const disciplinas = new Set(quadros.map((q) => q.disciplina_id ?? ""));
+  if (disciplinas.size > 1) {
+    return res.status(400).json({ error: "Não é possível mesclar quadros de disciplinas diferentes" });
+  }
+
+  const allSlots = db
+    .prepare(
+      `select id, quadro_id, dia, periodo, matricula, tipo, expira_em, turma_codigo
+       from quadro_slots where quadro_id in (${quadroIds.map(() => "?").join(",")})`,
+    )
+    .all(...quadroIds) as Array<{
+    id: string;
+    quadro_id: string;
+    dia: number;
+    periodo: number;
+    matricula: string | null;
+    tipo: string;
+    expira_em: string | null;
+    turma_codigo: string | null;
+  }>;
+
+  const posicaoSet = new Set<string>();
+  for (const slot of allSlots) {
+    const key = `${slot.dia}:${slot.periodo}`;
+    if (posicaoSet.has(key)) {
+      const diaNome = ["", "Segunda", "Terça", "Quarta", "Quinta", "Sexta"][slot.dia] ?? `Dia ${slot.dia}`;
+      return res.status(400).json({
+        error: `Conflito de horário: ${diaNome}, ${slot.periodo}º período já está ocupado em outro quadro`,
+      });
+    }
+    posicaoSet.add(key);
+  }
+
+  try {
+    db.exec("BEGIN");
+
+    const principal = quadros[0]!;
+    const secundarios = quadros.slice(1);
+
+    const todasTurmas = normalizeTurmas(
+      quadros.flatMap((q) => parseTurmasJson(q.turmas_json, q.turma_codigo)),
+    );
+
+    const novoLabel = turmaLabel(todasTurmas);
+    const novoTurmasJson = JSON.stringify(todasTurmas);
+
+    // Primeiro deleta os quadros secundários (para liberar o constraint)
+    for (const sec of secundarios) {
+      db.prepare(
+        `update quadro_slots set quadro_id = ?, updated_at = datetime('now') where quadro_id = ?`,
+      ).run(principal.id, sec.id);
+
+      db.prepare("delete from quadros where id = ?").run(sec.id);
+    }
+
+    // Depois atualiza o principal com o novo turma_codigo
+    db.prepare(
+      `update quadros set turma_codigo = ?, turmas_json = ?, updated_at = datetime('now') where id = ?`,
+    ).run(novoLabel, novoTurmasJson, principal.id);
+
+    db.exec("COMMIT");
+
+    return res.json({
+      quadro_id: principal.id,
+      turmas: todasTurmas,
+      slots_total: allSlots.length,
+      quadros_mesclados: quadroIds.length,
+    });
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Erro ao mesclar quadros",
+    });
+  }
+});
+
+apiRouter.post("/quadros/:id/desmembrar", (req, res) => {
+  const quadroId = req.params.id;
+  const slotIds = Array.isArray(req.body?.slot_ids)
+    ? (req.body.slot_ids as unknown[]).map(String).filter(Boolean)
+    : [];
+  const turmasParam = Array.isArray(req.body?.turmas)
+    ? (req.body.turmas as unknown[]).map(String).filter(Boolean)
+    : [];
+
+  if (slotIds.length === 0) {
+    return res.status(400).json({ error: "Nenhum slot selecionado" });
+  }
+
+  const quadro = db
+    .prepare(
+      "select id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json from quadros where id = ?",
+    )
+    .get(quadroId) as
+    | {
+        id: string;
+        escola_id: string;
+        turma_codigo: string;
+        turno: string;
+        disciplina_id: string | null;
+        observacao: string | null;
+        turmas_json: string | null;
+      }
+    | undefined;
+
+  if (!quadro) {
+    return res.status(404).json({ error: "Quadro não encontrado" });
+  }
+
+  const turmasQuadro = parseTurmasJson(quadro.turmas_json, quadro.turma_codigo);
+
+  const slots = db
+    .prepare(
+      `select id, dia, periodo, matricula, tipo, expira_em, turma_codigo
+       from quadro_slots where quadro_id = ? and id in (${slotIds.map(() => "?").join(",")})`,
+    )
+    .all(quadroId, ...slotIds) as Array<{
+    id: string;
+    dia: number;
+    periodo: number;
+    matricula: string | null;
+    tipo: string;
+    expira_em: string | null;
+    turma_codigo: string | null;
+  }>;
+
+  if (slots.length === 0) {
+    return res.status(400).json({ error: "Nenhum slot encontrado" });
+  }
+
+  // Usa as turmas passadas pelo frontend, ou tenta identificar pelos slots
+  const turmasParaDesmembrar = turmasParam.length > 0
+    ? normalizeTurmas(turmasParam)
+    : normalizeTurmas([
+        ...new Set(
+          slots
+            .map((s) => s.turma_codigo || turmasQuadro[0] || quadro.turma_codigo)
+            .filter(Boolean),
+        ),
+      ]);
+
+  if (turmasParaDesmembrar.length === 0) {
+    return res.status(400).json({ error: "Não foi possível identificar as turmas" });
+  }
+
+  const turmasRestantes = turmasQuadro.filter(
+    (t) => !turmasParaDesmembrar.some((td) => td.toUpperCase() === t.toUpperCase()),
+  );
+
+  if (turmasRestantes.length === 0) {
+    return res.status(400).json({
+      error: "Não é possível desmembrar todas as turmas. Use excluir quadro.",
+    });
+  }
+
+  try {
+    db.exec("BEGIN");
+
+    const novoTurmaLabel = turmaLabel(turmasParaDesmembrar);
+    const novoTurmasJson = JSON.stringify(turmasParaDesmembrar);
+
+    // Usa um label temporário para o quadro original (para liberar o constraint)
+    const tempLabel = `__TEMP_${quadroId}__`;
+    db.prepare(
+      `update quadros set turma_codigo = ?, updated_at = datetime('now') where id = ?`,
+    ).run(tempLabel, quadroId);
+
+    // Verifica se já existe um quadro com o mesmo turma_codigo
+    const existente = db
+      .prepare(
+        `select id from quadros where escola_id = ? and turma_codigo = ? and turno = ? and disciplina_id is ? and id != ?`,
+      )
+      .get(quadro.escola_id, novoTurmaLabel, quadro.turno, quadro.disciplina_id, quadroId) as
+      | { id: string }
+      | undefined;
+
+    let novoQuadroId: string;
+
+    if (existente) {
+      // Quadro já existe, move os slots para ele
+      novoQuadroId = existente.id;
+      // Atualiza as turmas do quadro existente para incluir as novas
+      const existenteTurmasJson = db
+        .prepare("select turmas_json, turma_codigo from quadros where id = ?")
+        .get(existente.id) as { turmas_json: string | null; turma_codigo: string };
+      const existenteTurmas = parseTurmasJson(existenteTurmasJson.turmas_json, existenteTurmasJson.turma_codigo);
+      const turmasMescladas = normalizeTurmas([...existenteTurmas, ...turmasParaDesmembrar]);
+      db.prepare(
+        `update quadros set turma_codigo = ?, turmas_json = ?, updated_at = datetime('now') where id = ?`,
+      ).run(turmaLabel(turmasMescladas), JSON.stringify(turmasMescladas), existente.id);
+    } else {
+      // Cria novo quadro
+      novoQuadroId = uuid();
+      db.prepare(
+        `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
+         values (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        novoQuadroId,
+        quadro.escola_id,
+        novoTurmaLabel,
+        quadro.turno,
+        quadro.disciplina_id,
+        quadro.observacao,
+        novoTurmasJson,
+      );
+    }
+
+    // Move os slots para o novo quadro
+    for (const slot of slots) {
+      db.prepare(
+        `update quadro_slots set quadro_id = ?, updated_at = datetime('now') where id = ?`,
+      ).run(novoQuadroId, slot.id);
+    }
+
+    // Recalcula quais turmas ainda têm slots no quadro original
+    const slotsRestantes = db
+      .prepare(`select distinct turma_codigo from quadro_slots where quadro_id = ?`)
+      .all(quadroId) as Array<{ turma_codigo: string | null }>;
+
+    const turmasComSlots = normalizeTurmas(
+      slotsRestantes.map((s) => s.turma_codigo).filter((t): t is string => !!t),
+    );
+
+    // Se não houver mais slots, deleta o quadro original
+    if (turmasComSlots.length === 0) {
+      const countSlots = db
+        .prepare(`select count(*) as c from quadro_slots where quadro_id = ?`)
+        .get(quadroId) as { c: number };
+      if (countSlots.c === 0) {
+        db.prepare("delete from quadros where id = ?").run(quadroId);
+      } else {
+        // Tem slots mas sem turma_codigo, usa as turmas restantes calculadas antes
+        const restanteLabel = turmaLabel(turmasRestantes);
+        const restanteTurmasJson = JSON.stringify(turmasRestantes);
+        db.prepare(
+          `update quadros set turma_codigo = ?, turmas_json = ?, updated_at = datetime('now') where id = ?`,
+        ).run(restanteLabel, restanteTurmasJson, quadroId);
+      }
+    } else {
+      // Atualiza o quadro original com apenas as turmas que têm slots
+      const restanteLabel = turmaLabel(turmasComSlots);
+      const restanteTurmasJson = JSON.stringify(turmasComSlots);
+      db.prepare(
+        `update quadros set turma_codigo = ?, turmas_json = ?, updated_at = datetime('now') where id = ?`,
+      ).run(restanteLabel, restanteTurmasJson, quadroId);
+    }
+
+    db.exec("COMMIT");
+
+    return res.json({
+      novo_quadro_id: novoQuadroId,
+      turmas_desmembradas: turmasParaDesmembrar,
+      turmas_restantes: turmasComSlots,
+      slots_movidos: slots.length,
+      mesclado_com_existente: !!existente,
+    });
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "Erro ao desmembrar",
+    });
+  }
+});
+
 // Dashboard
 apiRouter.get("/dashboard", (_req, res) => {
   const now = new Date();
@@ -2171,7 +3239,8 @@ apiRouter.get("/dashboard", (_req, res) => {
   const slotsCobertos = (
     db
       .prepare(
-        `select count(*) as c from quadro_slots where matricula is not null`,
+        `select count(*) as c from quadro_slots
+         where matricula is not null and modalidade_cobertura = 'HORA_EXTRA'`,
       )
       .get() as { c: number }
   ).c;
@@ -2215,6 +3284,7 @@ apiRouter.get("/dashboard", (_req, res) => {
          select matricula, count(*) as t
          from quadro_slots
          where matricula is not null
+           and modalidade_cobertura = 'HORA_EXTRA'
          group by matricula
        )
        select p.matricula,

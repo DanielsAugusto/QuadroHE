@@ -7,12 +7,15 @@ import {
   useState,
 } from "react";
 import { Link } from "react-router-dom";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 import {
   EmptyState,
   ErrorBanner,
   Field,
   PageHeader,
   Panel,
+  btnSecondary,
   inputClass,
 } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -201,6 +204,8 @@ export function EscolasLotacaoPage() {
   const [aba, setAba] = useState<AbaEscolas>("funcionarios");
   const [contagens, setContagens] = useState<LotacaoContagens | null>(null);
   const [loadingContagens, setLoadingContagens] = useState(false);
+  const [pdfMenuOpen, setPdfMenuOpen] = useState(false);
+  const pdfMenuRef = useRef<HTMLDivElement>(null);
   const buscaFuncDeferred = useDeferredValue(buscaFunc);
 
   const loadEscolas = useCallback(async () => {
@@ -283,6 +288,9 @@ export function EscolasLotacaoPage() {
       if (!wrapRef.current?.contains(e.target as Node)) {
         setOpenSelect(false);
       }
+      if (!pdfMenuRef.current?.contains(e.target as Node)) {
+        setPdfMenuOpen(false);
+      }
     }
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
@@ -334,6 +342,143 @@ export function EscolasLotacaoPage() {
 
   const temFiltroColuna =
     filtroCargo.size > 0 || filtroFuncao.size > 0 || filtroTipoHora.size > 0;
+
+  function downloadPdfContagens(tipo: "cargos" | "funcoes" | "ambos") {
+    if (!contagens || !selected || !escolaAtual) return;
+    setPdfMenuOpen(false);
+
+    const doc = new jsPDF();
+    const pageWidth = doc.internal.pageSize.getWidth();
+
+    doc.setFontSize(16);
+    doc.setFont("helvetica", "bold");
+    doc.text(selected, 14, 20);
+
+    doc.setFontSize(10);
+    doc.setFont("helvetica", "normal");
+    const subtitulo = `${escolaAtual.total} na lotação · ${escolaAtual.normal} normal · ${escolaAtual.hora_extra} hora extra`;
+    doc.text(subtitulo, 14, 28);
+
+    let currentY = 38;
+
+    const addTable = (titulo: string, itens: LotacaoContagemItem[]) => {
+      if (itens.length === 0) return;
+
+      doc.setFontSize(12);
+      doc.setFont("helvetica", "bold");
+      doc.text(titulo, 14, currentY);
+      currentY += 6;
+
+      const soma = itens.reduce((acc, i) => acc + i.total, 0);
+      const somaNormal = itens.reduce((acc, i) => acc + i.normal, 0);
+      const somaHe = itens.reduce((acc, i) => acc + i.hora_extra, 0);
+
+      const body = itens.map((item) => [
+        item.nome,
+        item.total.toString(),
+        item.normal.toString(),
+        item.hora_extra.toString(),
+      ]);
+      body.push(["TOTAL", soma.toString(), somaNormal.toString(), somaHe.toString()]);
+
+      autoTable(doc, {
+        startY: currentY,
+        head: [[titulo, "Total", "Normal", "H.E."]],
+        body,
+        theme: "grid",
+        headStyles: { fillColor: [59, 130, 246], fontStyle: "bold" },
+        footStyles: { fillColor: [240, 240, 240], fontStyle: "bold" },
+        margin: { left: 14, right: 14 },
+        styles: { fontSize: 9 },
+        didParseCell: (data) => {
+          if (data.row.index === body.length - 1) {
+            data.cell.styles.fontStyle = "bold";
+            data.cell.styles.fillColor = [240, 240, 240];
+          }
+        },
+      });
+
+      currentY = (doc as jsPDF & { lastAutoTable: { finalY: number } }).lastAutoTable.finalY + 12;
+    };
+
+    if (tipo === "cargos" || tipo === "ambos") {
+      addTable("Cargos", contagens.cargos);
+    }
+    if (tipo === "funcoes" || tipo === "ambos") {
+      addTable("Funções", contagens.funcoes);
+    }
+
+    doc.setFontSize(8);
+    doc.setTextColor(128, 128, 128);
+    doc.text(
+      `Gerado em ${new Date().toLocaleString("pt-BR")}`,
+      pageWidth - 14,
+      doc.internal.pageSize.getHeight() - 10,
+      { align: "right" },
+    );
+
+    const sufixo = tipo === "ambos" ? "" : `-${tipo}`;
+    const nomeArquivo = `lotacao-${selected.replace(/[^a-zA-Z0-9]/g, "_")}${sufixo}.pdf`;
+    doc.save(nomeArquivo);
+  }
+
+  function downloadPdfFuncionarios() {
+    if (!selected || !escolaAtual || funcionariosFiltrados.length === 0) return;
+
+    const doc = new jsPDF({ orientation: "landscape" });
+    const pageWidth = doc.internal.pageSize.getWidth();
+
+    doc.setFontSize(16);
+    doc.setFont("helvetica", "bold");
+    doc.text(selected, 14, 20);
+
+    doc.setFontSize(10);
+    doc.setFont("helvetica", "normal");
+    let subtitulo = `${escolaAtual.total} na lotação · ${escolaAtual.normal} normal · ${escolaAtual.hora_extra} hora extra`;
+    if (temFiltroColuna) {
+      subtitulo += ` · Mostrando ${funcionariosFiltrados.length} funcionário(s)`;
+    }
+    doc.text(subtitulo, 14, 28);
+
+    const body = funcionariosFiltrados.map((f) => [
+      f.matricula,
+      f.nome,
+      f.cargo || "—",
+      f.funcao || "—",
+      f.tipohora || "—",
+      f.lotacao || "—",
+    ]);
+
+    autoTable(doc, {
+      startY: 36,
+      head: [["Matrícula", "Nome", "Cargo", "Função", "Tipo Hora", "Lotação"]],
+      body,
+      theme: "grid",
+      headStyles: { fillColor: [59, 130, 246], fontStyle: "bold" },
+      margin: { left: 14, right: 14 },
+      styles: { fontSize: 8, cellPadding: 2 },
+      columnStyles: {
+        0: { cellWidth: 25 },
+        1: { cellWidth: "auto" },
+        2: { cellWidth: 35 },
+        3: { cellWidth: 30 },
+        4: { cellWidth: 30 },
+        5: { cellWidth: 40 },
+      },
+    });
+
+    doc.setFontSize(8);
+    doc.setTextColor(128, 128, 128);
+    doc.text(
+      `Gerado em ${new Date().toLocaleString("pt-BR")} · ${funcionariosFiltrados.length} funcionário(s)`,
+      pageWidth - 14,
+      doc.internal.pageSize.getHeight() - 10,
+      { align: "right" },
+    );
+
+    const nomeArquivo = `funcionarios-${selected.replace(/[^a-zA-Z0-9]/g, "_")}.pdf`;
+    doc.save(nomeArquivo);
+  }
 
   function ContagemTable({
     titulo,
@@ -548,16 +693,52 @@ export function EscolasLotacaoPage() {
           </Panel>
         ) : contagens ? (
           <div className="space-y-4">
-            <div>
-              <h2 className="text-base font-semibold">{selected}</h2>
-              <p className="text-sm text-muted">
-                {escolaAtual
-                  ? `${escolaAtual.total} na lotação` +
-                    (escolaAtual.hora_extra
-                      ? ` · ${escolaAtual.normal} normal · ${escolaAtual.hora_extra} hora extra`
-                      : "")
-                  : null}
-              </p>
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-base font-semibold">{selected}</h2>
+                <p className="text-sm text-muted">
+                  {escolaAtual
+                    ? `${escolaAtual.total} na lotação` +
+                      (escolaAtual.hora_extra
+                        ? ` · ${escolaAtual.normal} normal · ${escolaAtual.hora_extra} hora extra`
+                        : "")
+                    : null}
+                </p>
+              </div>
+              <div className="relative" ref={pdfMenuRef}>
+                <button
+                  type="button"
+                  className={btnSecondary}
+                  onClick={() => setPdfMenuOpen((v) => !v)}
+                >
+                  Baixar PDF ▾
+                </button>
+                {pdfMenuOpen && (
+                  <div className="absolute right-0 top-full z-30 mt-1 w-44 rounded-md border border-border bg-surface shadow-lg">
+                    <button
+                      type="button"
+                      className="w-full px-4 py-2 text-left text-sm hover:bg-brand-soft/40"
+                      onClick={() => downloadPdfContagens("cargos")}
+                    >
+                      Só Cargos
+                    </button>
+                    <button
+                      type="button"
+                      className="w-full px-4 py-2 text-left text-sm hover:bg-brand-soft/40"
+                      onClick={() => downloadPdfContagens("funcoes")}
+                    >
+                      Só Funções
+                    </button>
+                    <button
+                      type="button"
+                      className="w-full px-4 py-2 text-left text-sm font-medium hover:bg-brand-soft/40"
+                      onClick={() => downloadPdfContagens("ambos")}
+                    >
+                      Cargos + Funções
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
             <div className="grid gap-4 lg:grid-cols-2">
               <ContagemTable titulo="Cargos" itens={contagens.cargos} />
@@ -590,15 +771,25 @@ export function EscolasLotacaoPage() {
                       : null}
                   </p>
                 </div>
-                <div className="w-full max-w-xs">
-                  <Field label="Filtrar funcionários">
-                    <input
-                      className={inputClass}
-                      placeholder="Nome, matrícula, cargo..."
-                      value={buscaFunc}
-                      onChange={(e) => setBuscaFunc(e.target.value)}
-                    />
-                  </Field>
+                <div className="flex items-end gap-3">
+                  <div className="w-full max-w-xs">
+                    <Field label="Filtrar funcionários">
+                      <input
+                        className={inputClass}
+                        placeholder="Nome, matrícula, cargo..."
+                        value={buscaFunc}
+                        onChange={(e) => setBuscaFunc(e.target.value)}
+                      />
+                    </Field>
+                  </div>
+                  <button
+                    type="button"
+                    className={btnSecondary}
+                    onClick={downloadPdfFuncionarios}
+                    disabled={funcionariosFiltrados.length === 0}
+                  >
+                    Baixar PDF
+                  </button>
                 </div>
               </div>
 
