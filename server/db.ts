@@ -253,6 +253,25 @@ function migrateHorasExtraColumns() {
   ensureColumn("horas_extra", "funcao", "text");
 }
 
+function migrateProfessorLotacoesIndex() {
+  try {
+    db.exec(`
+      drop index if exists idx_prof_lotacoes_natural;
+      create unique index if not exists idx_prof_lotacoes_natural on professor_lotacoes (
+        matricula,
+        ifnull(tipohora, ''),
+        ifnull(escola, ''),
+        ifnull(cod_lotacao, ''),
+        ifnull(lotacao, ''),
+        ifnull(funcao, ''),
+        ifnull(padrao, '')
+      );
+    `);
+  } catch (err) {
+    console.error("Falha ao migrar índice idx_prof_lotacoes_natural:", err);
+  }
+}
+
 /** Copia lotações legadas da tabela professores (1x) para professor_lotacoes. */
 function migrateProfessorLotacoesFromProfessores() {
   const count = db
@@ -454,7 +473,9 @@ export function initDb() {
       ifnull(tipohora, ''),
       ifnull(escola, ''),
       ifnull(cod_lotacao, ''),
-      ifnull(lotacao, '')
+      ifnull(lotacao, ''),
+      ifnull(funcao, ''),
+      ifnull(padrao, '')
     );
   `);
 
@@ -466,6 +487,7 @@ export function initDb() {
   migrateQuadrosMultiTurmas();
   repairProfessoresEncoding();
   migrateProfessorLotacoesFromProfessores();
+  migrateProfessorLotacoesIndex();
 
   const discCount = db.prepare("select count(*) as c from disciplinas").get() as
     | CountRow

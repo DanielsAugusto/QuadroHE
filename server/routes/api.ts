@@ -207,7 +207,9 @@ apiRouter.post("/professores/import", (req, res) => {
        and ifnull(tipohora, '') = ifnull(?, '')
        and ifnull(escola, '') = ifnull(?, '')
        and ifnull(cod_lotacao, '') = ifnull(?, '')
-       and ifnull(lotacao, '') = ifnull(?, '')`,
+       and ifnull(lotacao, '') = ifnull(?, '')
+       and ifnull(funcao, '') = ifnull(?, '')
+       and ifnull(padrao, '') = ifnull(?, '')`,
   );
   const insertLotacao = db.prepare(
     `insert into professor_lotacoes (
@@ -299,6 +301,8 @@ apiRouter.post("/professores/import", (req, res) => {
         escola,
         cod_lotacao,
         lotacao,
+        funcao,
+        padrao,
       ) as { id: string } | undefined;
 
       if (existingLot) {
