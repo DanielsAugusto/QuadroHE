@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import {
   ConfirmDialog,
   ErrorBanner,
+  Field,
+  Modal,
   PageHeader,
   Panel,
+  btnPrimary,
   btnSecondary,
+  inputClass,
 } from "@/components/ui";
 import { api } from "@/lib/api";
 import {
@@ -19,7 +23,6 @@ import {
   type Professor,
   type Quadro,
   type QuadroSlot,
-  type TipoCarencia,
   type Turno,
 } from "@/lib/types";
 
@@ -83,6 +86,10 @@ function rangeKeys(a: CellPos, b: CellPos): string[] {
 export function QuadroTurmaPage() {
   const { escolaId, quadroId } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  const voltarTurmas =
+    (location.state as { from?: string } | null)?.from ??
+    `/carencias/doc1/${escolaId}`;
   const [data, setData] = useState<QuadroData | null>(null);
   const [professores, setProfessores] = useState<Professor[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -91,8 +98,6 @@ export function QuadroTurmaPage() {
   const [openProfSelect, setOpenProfSelect] = useState(false);
   const profSelectRef = useRef<HTMLDivElement>(null);
   const profListId = useId();
-  const [tipoCarencia, setTipoCarencia] = useState<TipoCarencia>("REAL");
-  const [expiraEm, setExpiraEm] = useState("");
   const [modalidadeCobertura, setModalidadeCobertura] = useState<ModalidadeCobertura>("HORA_EXTRA");
   const [selecao, setSelecao] = useState<Set<string>>(new Set());
   const [ancora, setAncora] = useState<CellPos | null>(null);
@@ -102,7 +107,7 @@ export function QuadroTurmaPage() {
   const [confirmLicenca, setConfirmLicenca] = useState(false);
   const [confirmEncerrarLicenca, setConfirmEncerrarLicenca] = useState(false);
   const [licencaAte, setLicencaAte] = useState("");
-  const [barMinimizada, setBarMinimizada] = useState(true);
+  const [licencaMotivo, setLicencaMotivo] = useState("");
 
   const load = useCallback(async () => {
     if (!quadroId) return;
@@ -180,13 +185,11 @@ export function QuadroTurmaPage() {
 
   function payloadCarencia(ativo: boolean) {
     if (!ativo) return { ativo: false as const };
-    if (tipoCarencia === "TEMPORARIA" && !/^\d{4}-\d{2}-\d{2}$/.test(expiraEm)) {
-      throw new Error("Informe a data de expiração da carência temporária.");
-    }
+    // Temporária passa a vir só da licença; marcação manual é sempre Real.
     return {
       ativo: true as const,
-      tipo: tipoCarencia,
-      expira_em: tipoCarencia === "TEMPORARIA" ? expiraEm : null,
+      tipo: "REAL" as const,
+      expira_em: null,
       turma_codigo: turmaAtiva || undefined,
     };
   }
@@ -241,10 +244,9 @@ export function QuadroTurmaPage() {
       for (const c of cells) {
         const slotExistente = slotMap.get(posKey(c));
         const turmaDoSlot = slotExistente?.turma_codigo || turmaAtiva;
-        const tipoDoSlot = slotExistente?.tipo || tipoCarencia;
-        const expiraDoSlot = slotExistente?.expira_em ?? (tipoCarencia === "TEMPORARIA" ? expiraEm : null);
-        const modalidadeDoSlot = slotExistente?.modalidade_cobertura || modalidadeCobertura;
-        
+        const tipoDoSlot = slotExistente?.tipo || "REAL";
+        const expiraDoSlot = slotExistente?.expira_em ?? null;
+
         await api(`/quadros/${quadroId}/slots`, {
           method: "PUT",
           body: JSON.stringify({
@@ -254,7 +256,7 @@ export function QuadroTurmaPage() {
             tipo: tipoDoSlot,
             expira_em: expiraDoSlot,
             turma_codigo: turmaDoSlot,
-            modalidade_cobertura: modalidadeDoSlot,
+            modalidade_cobertura: modalidadeCobertura,
           }),
         });
       }
@@ -271,7 +273,11 @@ export function QuadroTurmaPage() {
 
       await api(`/quadros/${quadroId}/atribuir`, {
         method: "POST",
-        body: JSON.stringify({ matricula: professorSel, slot_ids: ids }),
+        body: JSON.stringify({
+          matricula: professorSel,
+          slot_ids: ids,
+          modalidade_cobertura: modalidadeCobertura,
+        }),
       });
       await load();
       limparSelecao();
@@ -317,6 +323,11 @@ export function QuadroTurmaPage() {
       setError("Informe a data de retorno da licença.");
       return;
     }
+    const motivo = licencaMotivo.trim();
+    if (!motivo) {
+      setError("Informe o motivo da licença.");
+      return;
+    }
     const ids = [...selecao]
       .map((k) => slotMap.get(k))
       .filter((s): s is QuadroSlot => !!s && (!!s.matricula || !!s.titular_matricula))
@@ -331,16 +342,22 @@ export function QuadroTurmaPage() {
     setError(null);
     setConfirmLicenca(false);
     try {
-      const result = await api<{ updated: number; erros: string[] }>(
-        `/quadros/${quadroId}/licenca`,
-        {
-          method: "POST",
-          body: JSON.stringify({ slot_ids: ids, ate: licencaAte }),
-        },
-      );
+      const result = await api<{
+        updated: number;
+        erros: string[];
+        quadros_atingidos?: number;
+      }>(`/quadros/${quadroId}/licenca`, {
+        method: "POST",
+        body: JSON.stringify({
+          slot_ids: ids,
+          ate: licencaAte,
+          motivo,
+        }),
+      });
       if (result.erros?.length) {
         setError(result.erros[0] ?? "Erro ao abrir licença");
       }
+      setLicencaMotivo("");
       await load();
       limparSelecao();
     } catch (err) {
@@ -492,7 +509,7 @@ export function QuadroTurmaPage() {
     return (
       <div>
         <ErrorBanner message={error} />
-        <Link to={`/carencias/doc1/${escolaId}`} className={btnSecondary}>
+        <Link to={voltarTurmas} className={btnSecondary}>
           Voltar
         </Link>
       </div>
@@ -569,9 +586,9 @@ export function QuadroTurmaPage() {
         title={titulo}
         description={`${q.escola_nome} · ${TURNO_LABEL[turno]}${
           q.disciplina_codigo ? ` · ${q.disciplina_codigo}` : ""
-        }. Selecione os horários, a turma e a ação no menu.`}
+        }. Selecione horários na grade para marcar carência ou atribuir professor.`}
         actions={
-          <Link to={`/carencias/doc1/${escolaId}`} className={btnSecondary}>
+          <Link to={voltarTurmas} className={btnSecondary}>
             Voltar às turmas
           </Link>
         }
@@ -754,16 +771,18 @@ export function QuadroTurmaPage() {
                     }
 
                     return (
-                      <td key={d.id} className="border border-border p-0">
+                      <td
+                        key={d.id}
+                        className="border border-border p-0"
+                        style={{ height: 1 }}
+                      >
                         <button
                           type="button"
                           onMouseDown={(e) => {
                             if (e.shiftKey) e.preventDefault();
                           }}
                           onClick={(e) => onCellClick(e, d.id, periodo)}
-                          className={`flex w-full flex-col items-center justify-center gap-0.5 px-1 font-medium transition hover:brightness-95 ${
-                            emLicenca ? "min-h-[4.5rem] py-1" : "h-14"
-                          } ${cellClass}`}
+                          className={`flex h-full w-full min-h-14 flex-col items-center justify-center gap-0.5 px-1 py-1 font-medium transition hover:brightness-95 ${cellClass}`}
                           title={tituloParts.join(" · ")}
                         >
                           <span>{slot ? turmaCell : "·"}</span>
@@ -822,7 +841,7 @@ export function QuadroTurmaPage() {
                     <Link
                       to={`/professores/${p.matricula}`}
                       state={{
-                        from: `/carencias/${escolaId}/${quadroId}`,
+                        from: `${location.pathname}${location.search}`,
                       }}
                       className="font-medium text-brand underline-offset-2 hover:underline"
                     >
@@ -840,58 +859,52 @@ export function QuadroTurmaPage() {
       </div>
 
       <div className="pointer-events-none fixed inset-x-3 bottom-5 z-50 flex justify-center lg:left-[calc(var(--app-sidebar,16rem)+1.5rem)] lg:right-6">
-        <div className="pointer-events-auto w-full overflow-hidden rounded-2xl border border-border bg-surface/95 text-foreground shadow-[0_12px_40px_-16px_rgba(28,42,51,0.35)] backdrop-blur-md">
+        <div className="pointer-events-auto w-full max-w-4xl rounded-2xl border border-border bg-surface/95 text-foreground shadow-[0_12px_40px_-16px_rgba(28,42,51,0.35)] backdrop-blur-md">
           {selecao.size === 0 ? (
-            <div className="flex items-center gap-3 px-4 py-3.5">
-              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand-soft text-sm font-semibold text-brand">
+            <div className="flex items-center gap-3 px-4 py-3">
+              <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-brand-soft text-xs font-semibold text-brand">
                 ·
               </span>
-              <div>
-                <p className="text-sm font-medium text-brand-dark">
-                  Nenhuma célula selecionada
-                </p>
-                <p className="text-xs text-muted">
-                  Clique na grade para somar · Shift marca intervalo
-                </p>
-              </div>
+              <p className="text-sm text-muted">
+                Selecione horários na grade · Shift marca intervalo
+              </p>
             </div>
           ) : (
-            <div className="flex flex-col gap-3 p-3 sm:p-3.5">
-              <div className="flex flex-wrap items-center justify-between gap-2 px-1">
-                <div className="flex items-center gap-2.5">
-                  <button
-                    type="button"
-                    className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-brand text-white transition hover:bg-brand-dark"
-                    onClick={() => setBarMinimizada((v) => !v)}
-                    title={barMinimizada ? "Expandir" : "Minimizar"}
-                  >
-                    <svg
-                      xmlns="http://www.w3.org/2000/svg"
-                      className={`h-4 w-4 transition-transform ${barMinimizada ? "rotate-180" : ""}`}
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      strokeWidth={2.5}
+            <div className="flex flex-col gap-2.5 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-sm font-medium text-brand-dark">
+                  {selecao.size} horário{selecao.size === 1 ? "" : "s"}
+                  {saving ? (
+                    <span className="ml-2 text-xs font-normal text-muted">
+                      Salvando…
+                    </span>
+                  ) : null}
+                </p>
+                <div className="flex flex-wrap items-center justify-end gap-1.5">
+                  {podeAbrirLicenca ? (
+                    <button
+                      type="button"
+                      className="h-8 cursor-pointer rounded-lg border border-fuchsia-300 bg-fuchsia-50 px-3 text-xs font-medium text-fuchsia-900 transition hover:bg-fuchsia-100 disabled:opacity-45"
+                      disabled={saving}
+                      onClick={() => {
+                        if (!licencaAte) setLicencaAte(hojeISO());
+                        setConfirmLicenca(true);
+                      }}
                     >
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-                    </svg>
-                  </button>
-                  <div>
-                    <p className="text-sm font-medium leading-none text-brand-dark">
-                      {selecao.size} horário{selecao.size === 1 ? "" : "s"} selecionado
-                      {selecao.size === 1 ? "" : "s"}
-                    </p>
-                    {saving ? (
-                      <p className="mt-1 text-xs text-muted">Salvando…</p>
-                    ) : (
-                      <p className="mt-1 text-xs text-muted">
-                        {barMinimizada ? "Clique na seta para expandir" : "Escolha a turma e a ação"}
-                      </p>
-                    )}
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  {podeDesmembrar && !barMinimizada && (
+                      Abrir licença
+                    </button>
+                  ) : null}
+                  {podeEncerrarLicenca ? (
+                    <button
+                      type="button"
+                      className="h-8 cursor-pointer rounded-lg border border-border bg-white px-3 text-xs font-medium text-foreground transition hover:bg-background disabled:opacity-45"
+                      disabled={saving}
+                      onClick={() => setConfirmEncerrarLicenca(true)}
+                    >
+                      Encerrar licença
+                    </button>
+                  ) : null}
+                  {podeDesmembrar ? (
                     <button
                       type="button"
                       className="h-8 cursor-pointer rounded-lg border border-border bg-white px-3 text-xs font-medium text-foreground transition hover:bg-background disabled:opacity-45"
@@ -900,26 +913,32 @@ export function QuadroTurmaPage() {
                     >
                       Desmembrar ({turmasDosSlotsSelecionados.join(", ")})
                     </button>
-                  )}
+                  ) : null}
                   <button
                     type="button"
-                    className="cursor-pointer rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted transition hover:bg-brand-soft/60 hover:text-brand-dark"
+                    className="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg text-muted transition hover:bg-brand-soft/60 hover:text-brand-dark"
+                    title="Limpar seleção"
+                    aria-label="Limpar seleção"
                     onClick={limparSelecao}
                   >
-                    Limpar seleção
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2.25"
+                      className="h-4 w-4"
+                      aria-hidden
+                    >
+                      <path d="M6 6l12 12M18 6L6 18" />
+                    </svg>
                   </button>
                 </div>
               </div>
 
-              {!barMinimizada && (
-              <div className="grid gap-2 lg:grid-cols-[1.15fr_1fr]">
-                <section className="rounded-xl border border-border bg-white/70 p-2.5">
-                  <p className="mb-2 px-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted">
-                    Carência
-                  </p>
-
-                  {turmas.length > 0 ? (
-                    <div className="mb-2.5 flex flex-wrap gap-1.5 px-0.5">
+              <div className="flex flex-col gap-2.5">
+                {turmas.length > 0 ? (
+                    <div className="flex flex-wrap gap-1.5">
                       {turmas.map((t) => {
                         const ativa =
                           t.toUpperCase() === turmaAtiva.toUpperCase();
@@ -929,14 +948,14 @@ export function QuadroTurmaPage() {
                             key={t}
                             type="button"
                             onClick={() => setTurmaAtiva(t)}
-                            className={`min-w-[3.25rem] rounded-lg border px-2.5 py-1.5 text-left transition ${
+                            className={`rounded-lg border px-2.5 py-1 text-left transition ${
                               ativa
                                 ? "border-brand bg-brand text-white shadow-sm"
                                 : "border-border bg-white text-foreground hover:border-brand/40 hover:bg-brand-soft/40"
                             }`}
                             title={`Turma ${t}`}
                           >
-                            <span className="block text-sm font-semibold leading-none">
+                            <span className="block text-xs font-semibold leading-none">
                               {t}
                             </span>
                             <span
@@ -953,19 +972,38 @@ export function QuadroTurmaPage() {
                   ) : null}
 
                   <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="h-8 cursor-pointer rounded-lg bg-brand px-3 text-xs font-semibold text-white transition hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-45"
+                      disabled={saving || !turmaAtiva}
+                      onClick={() => void setSlotsAtivos(true)}
+                    >
+                      Marcar{turmaAtiva ? ` · ${turmaAtiva}` : ""}
+                    </button>
+                    <button
+                      type="button"
+                      className="h-8 cursor-pointer rounded-lg border border-border bg-white px-3 text-xs font-medium text-foreground transition hover:bg-background disabled:cursor-not-allowed disabled:opacity-45"
+                      disabled={saving}
+                      onClick={() => void setSlotsAtivos(false)}
+                    >
+                      Remover
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 border-t border-border/70 pt-2.5">
                     <div className="inline-flex rounded-lg bg-background p-0.5 ring-1 ring-border">
                       {(
                         [
-                          ["REAL", "Real"],
-                          ["TEMPORARIA", "Temporária"],
+                          ["HORA_EXTRA", "H.E."],
+                          ["NORMAL", "Normal"],
                         ] as const
                       ).map(([value, label]) => (
                         <button
                           key={value}
                           type="button"
-                          onClick={() => setTipoCarencia(value)}
-                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
-                            tipoCarencia === value
+                          onClick={() => setModalidadeCobertura(value)}
+                          className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition ${
+                            modalidadeCobertura === value
                               ? "bg-brand text-white shadow-sm"
                               : "text-muted hover:text-foreground"
                           }`}
@@ -974,70 +1012,10 @@ export function QuadroTurmaPage() {
                         </button>
                       ))}
                     </div>
-
-                    {tipoCarencia === "TEMPORARIA" ? (
-                      <input
-                        type="date"
-                        aria-label="Data de expiração"
-                        className="h-8 rounded-lg border border-border bg-white px-2.5 text-xs text-foreground outline-none focus:ring-2 focus:ring-brand/30"
-                        value={expiraEm}
-                        min={hojeISO()}
-                        onChange={(e) => setExpiraEm(e.target.value)}
-                      />
-                    ) : null}
-
-                    <div className="ml-auto flex flex-wrap gap-1.5">
-                      <button
-                        type="button"
-                        className="h-8 cursor-pointer rounded-lg bg-brand px-3 text-xs font-semibold text-white transition hover:bg-brand-dark disabled:cursor-not-allowed disabled:opacity-45"
-                        disabled={
-                          saving ||
-                          !turmaAtiva ||
-                          (tipoCarencia === "TEMPORARIA" && !expiraEm)
-                        }
-                        onClick={() => void setSlotsAtivos(true)}
-                      >
-                        Marcar{turmaAtiva ? ` · ${turmaAtiva}` : ""}
-                      </button>
-                      <button
-                        type="button"
-                        className="h-8 cursor-pointer rounded-lg border border-border bg-white px-3 text-xs font-medium text-foreground transition hover:bg-background disabled:cursor-not-allowed disabled:opacity-45"
-                        disabled={saving}
-                        onClick={() => void setSlotsAtivos(false)}
-                      >
-                        Remover
-                      </button>
-                    </div>
-                  </div>
-                </section>
-
-                <section className="rounded-xl border border-border bg-white/70 p-2.5">
-                  <p className="mb-2 px-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted">
-                    Professor
-                  </p>
-                  <div className="mb-2 inline-flex rounded-lg bg-background p-0.5 ring-1 ring-border">
-                    {(
-                      [
-                        ["HORA_EXTRA", "Hora Extra"],
-                        ["NORMAL", "Hora Normal"],
-                      ] as const
-                    ).map(([value, label]) => (
-                      <button
-                        key={value}
-                        type="button"
-                        onClick={() => setModalidadeCobertura(value)}
-                        className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
-                          modalidadeCobertura === value
-                            ? "bg-brand text-white shadow-sm"
-                            : "text-muted hover:text-foreground"
-                        }`}
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <div className="relative min-w-[160px] flex-1" ref={profSelectRef}>
+                    <div
+                      className="relative min-w-[10rem] flex-1"
+                      ref={profSelectRef}
+                    >
                       <input
                         aria-label="Professor"
                         role="combobox"
@@ -1048,7 +1026,7 @@ export function QuadroTurmaPage() {
                         placeholder={
                           professorSel
                             ? `${professorNome} (${professorSel})`
-                            : "Buscar nome ou matrícula…"
+                            : "Professor…"
                         }
                         value={
                           openProfSelect || buscaProfessor ? buscaProfessor : ""
@@ -1141,38 +1119,7 @@ export function QuadroTurmaPage() {
                       Tirar
                     </button>
                   </div>
-                  <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-border/70 pt-2">
-                    <span className="px-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted">
-                      Licença
-                    </span>
-                    <input
-                      type="date"
-                      aria-label="Data de retorno da licença"
-                      className="h-8 rounded-lg border border-border bg-white px-2.5 text-xs text-foreground outline-none focus:ring-2 focus:ring-brand/30"
-                      value={licencaAte}
-                      min={hojeISO()}
-                      onChange={(e) => setLicencaAte(e.target.value)}
-                    />
-                    <button
-                      type="button"
-                      className="h-8 cursor-pointer rounded-lg border border-fuchsia-300 bg-fuchsia-50 px-3 text-xs font-medium text-fuchsia-900 transition hover:bg-fuchsia-100 disabled:cursor-not-allowed disabled:opacity-45"
-                      disabled={saving || !podeAbrirLicenca || !licencaAte}
-                      onClick={() => setConfirmLicenca(true)}
-                    >
-                      Abrir licença
-                    </button>
-                    <button
-                      type="button"
-                      className="h-8 cursor-pointer rounded-lg border border-border bg-white px-3 text-xs font-medium text-foreground transition hover:bg-background disabled:cursor-not-allowed disabled:opacity-45"
-                      disabled={saving || !podeEncerrarLicenca}
-                      onClick={() => setConfirmEncerrarLicenca(true)}
-                    >
-                      Encerrar licença
-                    </button>
-                  </div>
-                </section>
               </div>
-              )}
             </div>
           )}
         </div>
@@ -1197,30 +1144,68 @@ export function QuadroTurmaPage() {
         onClose={() => setConfirmDesmembrar(false)}
       />
 
-      <ConfirmDialog
+      <Modal
         open={confirmLicenca}
         title="Abrir licença"
-        message={
-          <>
-            O titular fica registrado e o horário vira carência temporária até{" "}
-            <strong>{licencaAte ? formatDataBR(licencaAte) : "—"}</strong>.
-            <br />
-            Depois você pode atribuir um substituto. Ao encerrar, o titular volta
-            automaticamente.
-          </>
-        }
-        confirmLabel="Abrir licença"
-        onConfirm={() => void abrirLicenca()}
-        onClose={() => setConfirmLicenca(false)}
-      />
+        onClose={() => {
+          if (!saving) setConfirmLicenca(false);
+        }}
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted">
+            A licença vale em <strong className="text-foreground">todos os
+            quadros</strong> em que o professor aparece. Os horários viram
+            carência temporária; depois você pode atribuir um substituto.
+          </p>
+          <Field label="Data de retorno">
+            <input
+              type="date"
+              className={inputClass}
+              value={licencaAte}
+              min={hojeISO()}
+              onChange={(e) => setLicencaAte(e.target.value)}
+              required
+            />
+          </Field>
+          <Field label="Motivo da licença">
+            <textarea
+              className={`${inputClass} min-h-[72px] resize-y`}
+              value={licencaMotivo}
+              onChange={(e) => setLicencaMotivo(e.target.value)}
+              placeholder="Ex.: Licença médica, capacitação…"
+              required
+            />
+          </Field>
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              className={btnSecondary}
+              disabled={saving}
+              onClick={() => setConfirmLicenca(false)}
+            >
+              Cancelar
+            </button>
+            <button
+              type="button"
+              className={btnPrimary}
+              disabled={saving || !licencaAte || !licencaMotivo.trim()}
+              onClick={() => void abrirLicenca()}
+            >
+              {saving ? "Abrindo…" : "Abrir licença"}
+            </button>
+          </div>
+        </div>
+      </Modal>
 
       <ConfirmDialog
         open={confirmEncerrarLicenca}
         title="Encerrar licença"
         message={
           <>
-            Devolver <strong>{qtdLicencaSelecionada}</strong> horário(s) ao
-            titular e remover o substituto, se houver?
+            Encerrar a licença do professor em{" "}
+            <strong>todos os quadros</strong> (a partir dos{" "}
+            <strong>{qtdLicencaSelecionada}</strong> horário(s) selecionados) e
+            devolver ao titular, removendo o substituto se houver?
           </>
         }
         confirmLabel="Encerrar licença"

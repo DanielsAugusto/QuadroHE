@@ -44,6 +44,43 @@ export type ProfessorLotacao = {
   observacao?: string | null;
 };
 
+export type StatusLicenca = "ABERTA" | "ENCERRADA";
+
+export type ProfessorLicenca = {
+  id: string;
+  matricula: string;
+  professor_nome?: string | null;
+  slot_id?: string | null;
+  quadro_id?: string | null;
+  escola_id?: string | null;
+  escola_nome?: string | null;
+  turma_codigo?: string | null;
+  turno?: Turno | null;
+  disciplina_codigo?: string | null;
+  dia?: number | null;
+  periodo?: number | null;
+  inicio: string;
+  retorno_previsto: string;
+  encerrada_em?: string | null;
+  motivo?: string | null;
+  status: StatusLicenca;
+  /** 1 = ativa no histórico; 0 = inativa (só configuração/ficha). */
+  ativo?: number | boolean | null;
+  inativado_em?: string | null;
+};
+
+export const STATUS_LICENCA_LABEL: Record<StatusLicenca, string> = {
+  ABERTA: "Aberta",
+  ENCERRADA: "Encerrada",
+};
+
+export function isLicencaAtiva(
+  l: Pick<ProfessorLicenca, "ativo">,
+): boolean {
+  if (l.ativo === undefined || l.ativo === null) return true;
+  return Number(l.ativo) !== 0;
+}
+
 export type Escola = {
   id: string;
   nome: string;
@@ -153,6 +190,9 @@ export type HoraExtra = {
   unidade?: string | null;
   cargo?: string | null;
   funcao?: string | null;
+  /** 1 = ativa (relatório); 0 = inativa (só histórico na ficha). */
+  ativo?: number | boolean | null;
+  inativado_em?: string | null;
   professor_nome?: string;
   professor_cargo?: string | null;
   professor_funcao?: string | null;
@@ -277,11 +317,18 @@ export function todayISO(hoje = new Date()): string {
   return `${y}-${m}-${d}`;
 }
 
-/** HE vigente: sem término, ou término ainda não passou (vale até o dia do término). */
+/** HE ainda considerada ativa no cadastro (não inativada). */
+export function isHeAtiva(he: Pick<HoraExtra, "ativo">): boolean {
+  if (he.ativo === undefined || he.ativo === null) return true;
+  return Number(he.ativo) !== 0;
+}
+
+/** HE vigente: ativa, sem término futuro pendente, ou término ainda não passou. */
 export function isHeVigente(
-  he: Pick<HoraExtra, "inicio" | "termino">,
+  he: Pick<HoraExtra, "inicio" | "termino" | "ativo">,
   hoje = new Date(),
 ): boolean {
+  if (!isHeAtiva(he)) return false;
   const today = todayISO(hoje);
   if (he.inicio && he.inicio > today) return false;
   // Expirada a partir do dia seguinte ao término (= término até ontem)
@@ -289,11 +336,12 @@ export function isHeVigente(
   return true;
 }
 
-/** HE com término até ontem (já expirou). */
+/** HE com término até ontem (já expirou). Inativas não entram aqui. */
 export function isHeExpirada(
-  he: Pick<HoraExtra, "termino">,
+  he: Pick<HoraExtra, "termino" | "ativo">,
   hoje = new Date(),
 ): boolean {
+  if (!isHeAtiva(he)) return false;
   if (!he.termino) return false;
   return he.termino < todayISO(hoje);
 }

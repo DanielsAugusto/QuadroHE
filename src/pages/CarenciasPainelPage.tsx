@@ -342,6 +342,7 @@ export function CarenciasPainelPage() {
                     >
                       <Link
                         to={`/carencias/doc1/${e.escola_id}`}
+                        state={{ from: "/carencias/doc1/painel" }}
                         className="text-brand hover:underline"
                       >
                         {e.escola_nome}

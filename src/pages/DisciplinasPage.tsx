@@ -14,6 +14,7 @@ import {
   inputClass,
 } from "@/components/ui";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import type { Disciplina } from "@/lib/types";
 
 const emptyForm = { nome: "", codigo: "" };
@@ -23,6 +24,7 @@ export function DisciplinasPage({
 }: {
   embedded?: boolean;
 }) {
+  const { isAdmin } = useAuth();
   const [itens, setItens] = useState<Disciplina[]>([]);
   const [form, setForm] = useState(emptyForm);
   const [editing, setEditing] = useState<Disciplina | null>(null);
@@ -153,10 +155,12 @@ export function DisciplinasPage({
                           label={`Editar ${d.nome}`}
                           onClick={() => abrirEditar(d)}
                         />
-                        <IconDeleteButton
-                          label={`Excluir ${d.nome}`}
-                          onClick={() => setPendingDelete(d)}
-                        />
+                        {isAdmin ? (
+                          <IconDeleteButton
+                            label={`Excluir ${d.nome}`}
+                            onClick={() => setPendingDelete(d)}
+                          />
+                        ) : null}
                       </div>
                     </td>
                   </tr>

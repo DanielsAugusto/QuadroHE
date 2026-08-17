@@ -1,12 +1,14 @@
 const TOKEN_KEY = "quadrohe_token";
 
+let memoryToken: string | null = null;
+
 export function getToken() {
-  return localStorage.getItem(TOKEN_KEY);
+  return memoryToken ?? localStorage.getItem(TOKEN_KEY);
 }
 
 export function setToken(token: string | null) {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
+  memoryToken = token;
+  if (!token) localStorage.removeItem(TOKEN_KEY);
 }
 
 export async function api<T>(
@@ -20,7 +22,11 @@ export async function api<T>(
   const token = getToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
 
-  const res = await fetch(`/api${path}`, { ...options, headers });
+  const res = await fetch(`/api${path}`, {
+    credentials: "same-origin",
+    ...options,
+    headers,
+  });
 
   if (res.status === 204) return undefined as T;
 

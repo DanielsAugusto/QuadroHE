@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,13 +10,17 @@ import {
   repairMojibakeText,
   repairMojibakeValue,
 } from "../src/lib/textEncoding.ts";
+import { bcryptRounds, isWeakAdminPassword } from "./passwordPolicy.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(__dirname, "..", "data");
-const dbPath = path.join(dataDir, "quadrohe.sqlite");
+const dbPath = process.env.QUADROHE_DB_PATH || path.join(dataDir, "quadrohe.sqlite");
 
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+if (dbPath !== ":memory:") {
+  const dir = path.dirname(dbPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
 }
 
 export const db = new DatabaseSync(dbPath);
@@ -126,6 +131,52 @@ function migrateQuadrosUniqueComDisciplina() {
       insert into quadros__new
         (id, escola_id, turma_codigo, turno, disciplina_id, observacao, created_at, updated_at)
       select id, escola_id, turma_codigo, turno, disciplina_id, observacao, created_at, updated_at
+      from quadros;
+      drop table quadros;
+      alter table quadros__new rename to quadros;
+      create index if not exists idx_quadros_escola on quadros (escola_id);
+    `);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON;");
+  }
+}
+
+/** Permite vários quadros com as mesmas turmas, turno e disciplina. */
+function migrateQuadrosPermitirDuplicatas() {
+  const row = db
+    .prepare(
+      `select sql from sqlite_master where type = 'table' and name = 'quadros'`,
+    )
+    .get() as { sql: string } | undefined;
+  if (!row?.sql) return;
+  if (
+    !/unique\s*\(\s*escola_id\s*,\s*turma_codigo\s*,\s*turno/i.test(row.sql)
+  ) {
+    return;
+  }
+
+  db.exec("PRAGMA foreign_keys = OFF;");
+  db.exec("BEGIN");
+  try {
+    db.exec(`
+      create table quadros__new (
+        id text primary key,
+        escola_id text not null references escolas(id) on delete cascade,
+        turma_codigo text not null,
+        turno text not null check (turno in ('MANHA', 'TARDE', 'NOITE')),
+        disciplina_id text references disciplinas(id) on delete set null,
+        observacao text,
+        turmas_json text,
+        created_at text not null default (datetime('now')),
+        updated_at text not null default (datetime('now'))
+      );
+      insert into quadros__new
+        (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json, created_at, updated_at)
+      select id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json, created_at, updated_at
       from quadros;
       drop table quadros;
       alter table quadros__new rename to quadros;
@@ -251,6 +302,29 @@ function migrateHorasExtraColumns() {
   ensureColumn("horas_extra", "unidade", "text not null default 'TEMPOS'");
   ensureColumn("horas_extra", "cargo", "text");
   ensureColumn("horas_extra", "funcao", "text");
+  ensureColumn("horas_extra", "ativo", "integer not null default 1");
+  ensureColumn("horas_extra", "inativado_em", "text");
+}
+
+function migrateProfessorLicencasColumns() {
+  ensureColumn("professor_licencas", "ativo", "integer not null default 1");
+  ensureColumn("professor_licencas", "inativado_em", "text");
+  ensureColumn("professor_licencas", "motivo", "text");
+}
+
+function migrateUsuariosColumns() {
+  ensureColumn("usuarios", "papel", "text not null default 'admin'");
+  ensureColumn("usuarios", "ativo", "integer not null default 1");
+  ensureColumn("usuarios", "updated_at", "text");
+  ensureColumn("usuarios", "token_version", "integer not null default 1");
+  ensureColumn("usuarios", "mfa_secret", "text");
+  ensureColumn("usuarios", "mfa_enabled", "integer not null default 0");
+  db.exec(`
+    update usuarios set papel = 'admin' where papel is null or trim(papel) = '';
+    update usuarios set ativo = 1 where ativo is null;
+    update usuarios set token_version = 1 where token_version is null;
+    update usuarios set mfa_enabled = 0 where mfa_enabled is null;
+  `);
 }
 
 function migrateProfessorLotacoesIndex() {
@@ -337,6 +411,90 @@ function migrateProfessorLotacoesFromProfessores() {
   }
 }
 
+/** Registra no histórico as licenças já abertas em quadro_slots. */
+function migrateProfessorLicencasFromSlots() {
+  const table = db
+    .prepare(
+      `select name from sqlite_master where type = 'table' and name = 'professor_licencas'`,
+    )
+    .get();
+  if (!table) return;
+
+  const rows = db
+    .prepare(
+      `select s.id as slot_id, s.titular_matricula as matricula, s.dia, s.periodo,
+              s.turma_codigo, s.expira_em as retorno_previsto,
+              q.id as quadro_id, q.turno, q.escola_id,
+              e.nome as escola_nome, d.codigo as disciplina_codigo
+       from quadro_slots s
+       join quadros q on q.id = s.quadro_id
+       left join escolas e on e.id = q.escola_id
+       left join disciplinas d on d.id = q.disciplina_id
+       where s.titular_matricula is not null
+         and not exists (
+           select 1 from professor_licencas pl
+           where pl.slot_id = s.id and pl.status = 'ABERTA'
+         )`,
+    )
+    .all() as Array<{
+    slot_id: string;
+    matricula: string;
+    dia: number;
+    periodo: number;
+    turma_codigo: string | null;
+    retorno_previsto: string | null;
+    quadro_id: string;
+    turno: string | null;
+    escola_id: string | null;
+    escola_nome: string | null;
+    disciplina_codigo: string | null;
+  }>;
+
+  if (rows.length === 0) return;
+
+  const hoje = new Date();
+  const inicio = `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, "0")}-${String(hoje.getDate()).padStart(2, "0")}`;
+  const insert = db.prepare(
+    `insert into professor_licencas (
+       id, matricula, slot_id, quadro_id, escola_id, escola_nome,
+       turma_codigo, turno, disciplina_codigo, dia, periodo,
+       inicio, retorno_previsto, status
+     ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ABERTA')`,
+  );
+
+  db.exec("BEGIN");
+  try {
+    for (const row of rows) {
+      insert.run(
+        uuid(),
+        row.matricula,
+        row.slot_id,
+        row.quadro_id,
+        row.escola_id,
+        row.escola_nome,
+        row.turma_codigo,
+        row.turno,
+        row.disciplina_codigo,
+        row.dia,
+        row.periodo,
+        inicio,
+        row.retorno_previsto || inicio,
+      );
+    }
+    db.exec("COMMIT");
+    console.log(
+      `Registradas ${rows.length} licença(s) aberta(s) em professor_licencas.`,
+    );
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    console.error("Falha ao migrar licenças abertas:", err);
+  }
+}
+
 export function initDb() {
   db.exec(`
     create table if not exists usuarios (
@@ -344,7 +502,37 @@ export function initDb() {
       email text not null unique,
       senha_hash text not null,
       nome text not null,
-      created_at text not null default (datetime('now'))
+      papel text not null default 'admin'
+        check (papel in ('admin', 'operador')),
+      ativo integer not null default 1,
+      token_version integer not null default 1,
+      created_at text not null default (datetime('now')),
+      updated_at text not null default (datetime('now'))
+    );
+
+    create table if not exists audit_logs (
+      id text primary key,
+      created_at text not null default (datetime('now')),
+      user_id text,
+      user_email text,
+      user_nome text,
+      categoria text not null,
+      acao text not null,
+      entidade text,
+      entidade_id text,
+      resumo text not null,
+      detalhes text
+    );
+
+    create index if not exists idx_audit_logs_created on audit_logs (created_at desc);
+    create index if not exists idx_audit_logs_categoria on audit_logs (categoria);
+    create index if not exists idx_audit_logs_acao on audit_logs (acao);
+
+    create table if not exists login_lockouts (
+      email text primary key,
+      falhas integer not null default 0,
+      locked_until integer not null default 0,
+      updated_at text not null default (datetime('now'))
     );
 
     create table if not exists professores (
@@ -398,6 +586,8 @@ export function initDb() {
       unidade text not null default 'TEMPOS',
       cargo text,
       funcao text,
+      ativo integer not null default 1,
+      inativado_em text,
       created_at text not null default (datetime('now')),
       updated_at text not null default (datetime('now'))
     );
@@ -424,8 +614,7 @@ export function initDb() {
       observacao text,
       turmas_json text,
       created_at text not null default (datetime('now')),
-      updated_at text not null default (datetime('now')),
-      unique (escola_id, turma_codigo, turno, disciplina_id)
+      updated_at text not null default (datetime('now'))
     );
 
     create table if not exists quadro_slots (
@@ -477,17 +666,62 @@ export function initDb() {
       ifnull(funcao, ''),
       ifnull(padrao, '')
     );
+
+    create table if not exists professor_licencas (
+      id text primary key,
+      matricula text not null references professores(matricula) on delete cascade,
+      slot_id text,
+      quadro_id text,
+      escola_id text,
+      escola_nome text,
+      turma_codigo text,
+      turno text,
+      disciplina_codigo text,
+      dia integer,
+      periodo integer,
+      inicio text not null,
+      retorno_previsto text not null,
+      encerrada_em text,
+      motivo text,
+      status text not null default 'ABERTA'
+        check (status in ('ABERTA', 'ENCERRADA')),
+      ativo integer not null default 1,
+      inativado_em text,
+      created_at text not null default (datetime('now')),
+      updated_at text not null default (datetime('now'))
+    );
+
+    create index if not exists idx_prof_licencas_matricula on professor_licencas (matricula);
+    create index if not exists idx_prof_licencas_status on professor_licencas (status);
+    create unique index if not exists idx_prof_licencas_slot_aberta
+      on professor_licencas (slot_id) where status = 'ABERTA' and slot_id is not null;
   `);
 
   migrateQuadroSlotsColumns();
   migrateEscolasColumns();
   migrateProfessoresColumns();
   migrateHorasExtraColumns();
+  migrateProfessorLicencasColumns();
+  migrateUsuariosColumns();
+  ensureColumn("audit_logs", "request_id", "text");
+  db.exec(`
+    create table if not exists login_lockouts (
+      email text primary key,
+      falhas integer not null default 0,
+      locked_until integer not null default 0,
+      updated_at text not null default (datetime('now'))
+    );
+  `);
+  db.exec(
+    "create index if not exists idx_prof_licencas_ativo on professor_licencas (ativo)",
+  );
   migrateQuadrosUniqueComDisciplina();
   migrateQuadrosMultiTurmas();
+  migrateQuadrosPermitirDuplicatas();
   repairProfessoresEncoding();
   migrateProfessorLotacoesFromProfessores();
   migrateProfessorLotacoesIndex();
+  migrateProfessorLicencasFromSlots();
 
   const discCount = db.prepare("select count(*) as c from disciplinas").get() as
     | CountRow
@@ -515,11 +749,28 @@ export function initDb() {
     | CountRow
     | undefined;
   if (!userCount || userCount.c === 0) {
+    const isProd = process.env.NODE_ENV === "production";
     const email = process.env.ADMIN_EMAIL || "admin@secretaria.local";
-    const password = process.env.ADMIN_PASSWORD || "admin123";
-    const hash = bcrypt.hashSync(password, 12);
+    let password = process.env.ADMIN_PASSWORD;
+    if (!password) {
+      if (isProd) {
+        throw new Error(
+          "ADMIN_PASSWORD é obrigatório em produção ao criar o primeiro usuário",
+        );
+      }
+      password = randomBytes(18).toString("base64url");
+      console.warn(
+        `ADMIN_PASSWORD não definido. Senha gerada para o admin (guarde agora): ${password}`,
+      );
+    } else if (isProd && isWeakAdminPassword(password)) {
+      throw new Error(
+        "ADMIN_PASSWORD fraco ou de exemplo. Use senha aleatória com pelo menos 12 caracteres.",
+      );
+    }
+    const hash = bcrypt.hashSync(password, bcryptRounds());
     db.prepare(
-      "insert into usuarios (id, email, senha_hash, nome) values (?, ?, ?, ?)",
+      `insert into usuarios (id, email, senha_hash, nome, papel, ativo, token_version)
+       values (?, ?, ?, ?, 'admin', 1, 1)`,
     ).run(uuid(), email.toLowerCase(), hash, "Administrador");
     console.log(`Usuário admin criado: ${email}`);
   }

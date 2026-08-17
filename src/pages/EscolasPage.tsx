@@ -22,6 +22,7 @@ import {
   inputClass,
 } from "@/components/ui";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import type { Escola, Paginated } from "@/lib/types";
 
 const PAGE_SIZE = 20;
@@ -78,6 +79,7 @@ function parseEscolasExcel(buffer: ArrayBuffer) {
 }
 
 export function EscolasPage({ embedded = false }: { embedded?: boolean }) {
+  const { isAdmin } = useAuth();
   const [itens, setItens] = useState<Escola[]>([]);
   const [total, setTotal] = useState(0);
   const [nome, setNome] = useState("");
@@ -206,21 +208,25 @@ export function EscolasPage({ embedded = false }: { embedded?: boolean }) {
 
   const actions = (
     <>
-      <input
-        ref={fileRef}
-        type="file"
-        accept=".xlsx,.xls,.csv"
-        className="hidden"
-        onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
-      />
-      <button
-        type="button"
-        className={btnSecondary}
-        disabled={importing}
-        onClick={() => fileRef.current?.click()}
-      >
-        {importing ? "Importando..." : "Importar Excel"}
-      </button>
+      {isAdmin ? (
+        <>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            className="hidden"
+            onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
+          />
+          <button
+            type="button"
+            className={btnSecondary}
+            disabled={importing}
+            onClick={() => fileRef.current?.click()}
+          >
+            {importing ? "Importando..." : "Importar Excel"}
+          </button>
+        </>
+      ) : null}
       <button type="button" className={btnPrimary} onClick={abrirNova}>
         Nova escola
       </button>
@@ -284,10 +290,12 @@ export function EscolasPage({ embedded = false }: { embedded?: boolean }) {
                       label={`Editar ${e.nome}`}
                       onClick={() => abrirEditar(e)}
                     />
-                    <IconDeleteButton
-                      label={`Excluir ${e.nome}`}
-                      onClick={() => setPendingDelete(e)}
-                    />
+                    {isAdmin ? (
+                      <IconDeleteButton
+                        label={`Excluir ${e.nome}`}
+                        onClick={() => setPendingDelete(e)}
+                      />
+                    ) : null}
                   </div>
                 </li>
               ))}

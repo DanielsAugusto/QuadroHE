@@ -1,8 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
+  ConfirmDialog,
   EmptyState,
   ErrorBanner,
+  IconCloseButton,
   PageHeader,
   Panel,
   StatCard,
@@ -12,13 +14,18 @@ import { api } from "@/lib/api";
 import {
   DIAS,
   PERIODOS,
+  STATUS_LICENCA_LABEL,
   TIPO_HE_LABEL,
+  TURNO_LABEL,
   formatDateBR,
+  isHeAtiva,
   isHeExpirada,
   isHeVigente,
+  isLicencaAtiva,
   type Alocacao,
   type HoraExtra,
   type Professor,
+  type ProfessorLicenca,
   type ProfessorLotacao,
   type QuadroSlot,
 } from "@/lib/types";
@@ -29,31 +36,43 @@ type Ficha = {
   alocacoes: Alocacao[];
   slots: QuadroSlot[];
   lotacoes: ProfessorLotacao[];
+  licencas: ProfessorLicenca[];
 };
 
 type LocationState = {
   from?: string;
 };
 
+/** HE na ficha: professor atribuído com modalidade Hora Extra. */
+function isSlotHoraExtra(s: QuadroSlot, matricula: string) {
+  return s.matricula === matricula && s.modalidade_cobertura === "HORA_EXTRA";
+}
+
+/** Titular afastado nestes horários (licença aberta). */
+function isTitularEmLicenca(s: QuadroSlot, matricula: string) {
+  return s.titular_matricula === matricula || Boolean(s.em_licenca);
+}
+
 function VoltarButton() {
   const navigate = useNavigate();
   const location = useLocation();
-  const from = (location.state as LocationState | null)?.from;
+  /** Mantém a origem da navegação mesmo se a URL da ficha mudar (abas). */
+  const fromRef = useRef<string | null>(
+    typeof (location.state as LocationState | null)?.from === "string"
+      ? ((location.state as LocationState).from as string)
+      : null,
+  );
 
   return (
     <button
       type="button"
       className={btnSecondary}
       onClick={() => {
-        if (from) {
-          navigate(from);
+        if (fromRef.current) {
+          navigate(fromRef.current);
           return;
         }
-        if (window.history.length > 1) {
-          navigate(-1);
-          return;
-        }
-        navigate("/configuracao?tab=professores");
+        navigate(-1);
       }}
     >
       Voltar
@@ -65,6 +84,7 @@ const TABS = [
   { id: "resumo", label: "Resumo" },
   { id: "info", label: "Informações Adicionais" },
   { id: "lotacoes", label: "Lotações" },
+  { id: "licencas", label: "Licenças" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
 
@@ -75,25 +95,39 @@ export function FichaProfessorPage() {
   const activeTab: TabId = TABS.some((t) => t.id === tabParam) ? tabParam! : "resumo";
   const [data, setData] = useState<Ficha | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [pendingInativarLicenca, setPendingInativarLicenca] = useState<{
+    ids: string[];
+    label: string;
+  } | null>(null);
+  const [savingLicenca, setSavingLicenca] = useState(false);
 
-  useEffect(() => {
+  const load = useCallback(async () => {
     if (!matricula) return;
-    api<Ficha>(`/professores/${matricula}`)
-      .then(setData)
-      .catch((err) =>
-        setError(err instanceof Error ? err.message : "Erro ao carregar"),
-      );
+    try {
+      const ficha = await api<Ficha>(`/professores/${matricula}`);
+      setData(ficha);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erro ao carregar");
+    }
   }, [matricula]);
 
+  useEffect(() => {
+    void load();
+  }, [load]);
+
   function setTab(tab: TabId) {
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      next.set("tab", tab);
-      return next;
-    });
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set("tab", tab);
+        return next;
+      },
+      { replace: true },
+    );
   }
 
-  if (error) {
+  if (!data && error) {
     return (
       <div>
         <ErrorBanner message={error} />
@@ -106,20 +140,27 @@ export function FichaProfessorPage() {
     return <p className="text-sm text-muted">Carregando ficha...</p>;
   }
 
-  const { professor: p, horas_extra: hes, alocacoes: alocs, slots = [], lotacoes = [] } = data;
+  const {
+    professor: p,
+    horas_extra: hes,
+    alocacoes: alocs,
+    slots = [],
+    lotacoes = [],
+    licencas = [],
+  } = data;
   const heAutorizada = hes
     .filter((h) => isHeVigente(h))
     .reduce((acc, h) => acc + h.tempos_autorizados, 0);
   const heExpirada = hes.filter((h) => isHeExpirada(h)).length;
   const slotsComoCobertura = slots.filter((s) => s.matricula === p.matricula);
-  const slotsEmLicenca = slots.filter(
-    (s) => s.titular_matricula === p.matricula || !!s.em_licenca,
+  const slotsEmLicenca = slots.filter((s) =>
+    isTitularEmLicenca(s, p.matricula),
   );
-  const slotsHoraExtra = slotsComoCobertura.filter(
-    (s) => s.modalidade_cobertura === "HORA_EXTRA",
+  const slotsHoraExtra = slotsComoCobertura.filter((s) =>
+    isSlotHoraExtra(s, p.matricula),
   );
   const slotsHoraNormal = slotsComoCobertura.filter(
-    (s) => s.modalidade_cobertura === "NORMAL",
+    (s) => !isSlotHoraExtra(s, p.matricula),
   );
   const temposAloc =
     alocs.filter((a) => a.status === "ATIVA").reduce((acc, a) => acc + a.tempos, 0) +
@@ -128,6 +169,24 @@ export function FichaProfessorPage() {
 
   const extras = parseExtras(p.extras);
 
+  async function confirmarInativarLicenca() {
+    if (!pendingInativarLicenca) return;
+    setSavingLicenca(true);
+    try {
+      await api("/licencas/inativar", {
+        method: "POST",
+        body: JSON.stringify({ ids: pendingInativarLicenca.ids }),
+      });
+      setPendingInativarLicenca(null);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erro ao inativar");
+      setPendingInativarLicenca(null);
+    } finally {
+      setSavingLicenca(false);
+    }
+  }
+
   return (
     <div>
       <PageHeader
@@ -135,6 +194,7 @@ export function FichaProfessorPage() {
         description={`Matrícula ${p.matricula}${p.funcao ? ` · ${p.funcao}` : ""}${p.cargo ? ` · ${p.cargo}` : ""}`}
         actions={<VoltarButton />}
       />
+      <ErrorBanner message={error} />
 
       {/* Tabs */}
       <div className="mb-6 flex gap-1 border-b border-border">
@@ -198,6 +258,7 @@ export function FichaProfessorPage() {
                         <th className="px-2 py-2 font-medium">Tempos</th>
                         <th className="px-2 py-2 font-medium">Unidade</th>
                         <th className="px-2 py-2 font-medium">Tipo</th>
+                        <th className="px-2 py-2 font-medium">Situação</th>
                         <th className="px-2 py-2 font-medium">Início</th>
                         <th className="px-2 py-2 font-medium">Término</th>
                         <th className="px-2 py-2 font-medium">Disciplina</th>
@@ -207,8 +268,13 @@ export function FichaProfessorPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {hes.map((h) => (
-                        <tr key={h.id} className="border-b border-border/70">
+                      {hes.map((h) => {
+                        const ativa = isHeAtiva(h);
+                        return (
+                        <tr
+                          key={h.id}
+                          className={`border-b border-border/70 ${ativa ? "" : "bg-background/80 text-muted"}`}
+                        >
                           <td className="px-2 py-2 whitespace-nowrap">
                             {h.matricula}
                           </td>
@@ -219,6 +285,22 @@ export function FichaProfessorPage() {
                           </td>
                           <td className="px-2 py-2">{h.unidade ?? "TEMPOS"}</td>
                           <td className="px-2 py-2">{TIPO_HE_LABEL[h.tipo]}</td>
+                          <td className="px-2 py-2 whitespace-nowrap">
+                            {ativa ? (
+                              <span className="font-medium text-emerald-700">Ativa</span>
+                            ) : (
+                              <span
+                                className="font-medium text-amber-800"
+                                title={
+                                  h.inativado_em
+                                    ? `Inativada em ${formatDateBR(String(h.inativado_em).slice(0, 10))}`
+                                    : "Inativada"
+                                }
+                              >
+                                Inativa
+                              </span>
+                            )}
+                          </td>
                           <td className="px-2 py-2 whitespace-nowrap">
                             {formatDateBR(h.inicio)}
                           </td>
@@ -236,7 +318,8 @@ export function FichaProfessorPage() {
                             {h.observacao ?? "—"}
                           </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -283,62 +366,30 @@ export function FichaProfessorPage() {
                   slotsPorTurno.get(turno)!.push(s);
                 }
 
-                // Resumo: turma + faixa de tempos (+ validade / licença)
-                type ResumoItem = {
-                  key: string;
-                  escola: string;
-                  turma: string;
-                  turno: string;
-                  dia: number;
-                  de: number;
-                  ate: number;
-                  isHE: boolean;
-                  isTemp: boolean;
-                  isLicenca: boolean;
-                  expira: string | null;
-                };
-                const resumo: ResumoItem[] = [];
-                const sortedSlots = [...slots].sort(
-                  (a, b) =>
-                    (a.escola_nome ?? "").localeCompare(b.escola_nome ?? "", "pt-BR") ||
-                    (a.turno ?? "").localeCompare(b.turno ?? "") ||
-                    (a.dia ?? 0) - (b.dia ?? 0) ||
-                    (a.periodo ?? 0) - (b.periodo ?? 0) ||
-                    (a.turma_codigo ?? "").localeCompare(b.turma_codigo ?? "", "pt-BR"),
-                );
-                for (const s of sortedSlots) {
-                  const isLicenca =
-                    s.titular_matricula === p.matricula || !!s.em_licenca;
-                  const last = resumo[resumo.length - 1];
-                  const mesmaFaixa =
-                    last &&
-                    last.escola === (s.escola_nome ?? "—") &&
-                    last.turma === (s.turma_codigo ?? "—") &&
-                    last.turno === (s.turno ?? "MANHA") &&
-                    last.dia === s.dia &&
-                    last.isHE === (s.modalidade_cobertura === "HORA_EXTRA") &&
-                    last.isTemp === (s.tipo === "TEMPORARIA") &&
-                    last.isLicenca === isLicenca &&
-                    last.expira === (s.expira_em ?? null) &&
-                    last.ate + 1 === s.periodo;
-                  if (mesmaFaixa && last) {
-                    last.ate = s.periodo;
-                  } else {
-                    resumo.push({
-                      key: `${s.id ?? `${s.dia}-${s.periodo}-${s.turma_codigo}`}`,
-                      escola: s.escola_nome ?? "—",
-                      turma: s.turma_codigo ?? "—",
-                      turno: s.turno ?? "MANHA",
-                      dia: s.dia,
-                      de: s.periodo,
-                      ate: s.periodo,
-                      isHE: s.modalidade_cobertura === "HORA_EXTRA",
-                      isTemp: s.tipo === "TEMPORARIA",
-                      isLicenca,
-                      expira: s.expira_em ?? null,
-                    });
+                // Resumo compacto: totais de HE (modalidade) e licença (titular)
+                let temposHE = 0;
+                let temposLicenca = 0;
+                const expiracoesHE = new Set<string>();
+                const expiracoesLicenca = new Set<string>();
+                for (const s of slots) {
+                  if (isSlotHoraExtra(s, p.matricula)) {
+                    temposHE += 1;
+                    if (s.expira_em) expiracoesHE.add(String(s.expira_em).slice(0, 10));
+                  } else if (isTitularEmLicenca(s, p.matricula)) {
+                    temposLicenca += 1;
+                    if (s.expira_em) {
+                      expiracoesLicenca.add(String(s.expira_em).slice(0, 10));
+                    }
                   }
                 }
+                const formatExpiras = (set: Set<string>) => {
+                  const list = [...set].sort();
+                  if (list.length === 0) return "";
+                  if (list.length === 1) {
+                    return ` · até ${formatDateBR(list[0])}`;
+                  }
+                  return ` · até ${formatDateBR(list[0])}…`;
+                };
 
                 const renderGrid = (slotsGrupo: QuadroSlot[], turno: string) => {
                   const slotMap = new Map(
@@ -374,12 +425,12 @@ export function FichaProfessorPage() {
                                   const slot = slotMap.get(`${d.id}:${periodo}`);
                                   const escolaNome = slot?.escola_nome ?? "—";
                                   const colors = escolaColorMap.get(escolaNome);
-                                  const isHE = slot?.modalidade_cobertura === "HORA_EXTRA";
+                                  const isHE =
+                                    !!slot && isSlotHoraExtra(slot, p.matricula);
                                   const isLicenca =
-                                    !!slot &&
-                                    (slot.titular_matricula === p.matricula || !!slot.em_licenca);
+                                    !!slot && isTitularEmLicenca(slot, p.matricula);
                                   const turmaLabel = slot?.turma_codigo
-                                    ? `${slot.turma_codigo}${isLicenca ? " Lic." : isHE ? " HE" : ""}`
+                                    ? `${slot.turma_codigo}${isLicenca && slot.matricula !== p.matricula ? " Lic." : isHE ? " HE" : ""}`
                                     : "";
                                   return (
                                     <td
@@ -396,8 +447,15 @@ export function FichaProfessorPage() {
                                           ? [
                                               escolaNome,
                                               slot.turma_codigo,
-                                              isLicenca ? "Licença" : null,
-                                              isHE ? "Hora Extra" : slot.matricula ? "Hora Normal" : null,
+                                              isLicenca && slot.matricula !== p.matricula
+                                                ? "Licença (titular)"
+                                                : null,
+                                              isHE ? "Hora Extra" : null,
+                                              !isLicenca &&
+                                              !isHE &&
+                                              slot.matricula
+                                                ? "Cobertura"
+                                                : null,
                                               slot.expira_em
                                                 ? `até ${formatDateBR(String(slot.expira_em).slice(0, 10))}`
                                                 : null,
@@ -421,8 +479,6 @@ export function FichaProfessorPage() {
                 };
 
                 const turnos = ["MANHA", "TARDE", "NOITE"];
-                const diaLabel = (id: number) =>
-                  DIAS.find((d) => d.id === id)?.label.slice(0, 3) ?? String(id);
 
                 return (
                   <>
@@ -441,35 +497,21 @@ export function FichaProfessorPage() {
                       </div>
                     )}
 
-                    {resumo.length > 0 && (
+                    {(temposHE > 0 || temposLicenca > 0) && (
                       <div className="mb-4 flex flex-wrap gap-2">
-                        {resumo.map((r) => {
-                          const tempos =
-                            r.de === r.ate ? `${r.de}ª` : `${r.de}ª–${r.ate}ª`;
-                          const expiraTxt = r.expira
-                            ? ` · até ${formatDateBR(String(r.expira).slice(0, 10))}`
-                            : "";
-                          return (
-                            <span
-                              key={r.key}
-                              className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium text-white ${
-                                r.isLicenca
-                                  ? "bg-fuchsia-600"
-                                  : TURNO_COLORS[r.turno] ?? "bg-gray-500"
-                              }`}
-                              title={`${r.escola} · ${TURNO_LABELS[r.turno] ?? r.turno}${r.isLicenca ? " · Licença" : ""}`}
-                            >
-                              <strong>{r.turma}</strong>
-                              <span className="opacity-90">
-                                {diaLabel(r.dia)} {tempos}
-                                {r.isLicenca ? " · Licença" : ""}
-                                {!r.isLicenca && r.isHE ? " · HE" : ""}
-                                {!r.isLicenca && r.isTemp ? " · Temp." : ""}
-                                {expiraTxt}
-                              </span>
-                            </span>
-                          );
-                        })}
+                        {temposHE > 0 ? (
+                          <span className="inline-flex items-center rounded-md bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-950 ring-1 ring-amber-200">
+                            HE · {temposHE} tempo{temposHE === 1 ? "" : "s"}
+                            {formatExpiras(expiracoesHE)}
+                          </span>
+                        ) : null}
+                        {temposLicenca > 0 ? (
+                          <span className="inline-flex items-center rounded-md bg-fuchsia-100 px-2.5 py-1 text-xs font-medium text-fuchsia-950 ring-1 ring-fuchsia-200">
+                            Licença · {temposLicenca} tempo
+                            {temposLicenca === 1 ? "" : "s"}
+                            {formatExpiras(expiracoesLicenca)}
+                          </span>
+                        ) : null}
                       </div>
                     )}
 
@@ -508,16 +550,7 @@ export function FichaProfessorPage() {
               <InfoField label="Padrão" value={p.padrao} />
               <InfoField label="Raça" value={p.raca} />
               <InfoField label="Sexo" value={p.sexo} />
-            </div>
-          </Panel>
-
-          <Panel>
-            <h2 className="mb-4 font-display text-xl font-semibold text-brand-dark">
-              Datas
-            </h2>
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
               <InfoField label="Data Admissão" value={formatDateBR(p.dt_admiss)} />
-              <InfoField label="Data Início" value={formatDateBR(p.dt_inicio)} />
               <InfoField label="Rescisão" value={formatDateBR(p.rescisao)} />
             </div>
           </Panel>
@@ -531,6 +564,7 @@ export function FichaProfessorPage() {
               <InfoField label="Tipo Hora" value={p.tipohora} />
               <InfoField label="Cód. Lotação" value={p.cod_lotacao} />
               <InfoField label="Lotação" value={p.lotacao} />
+              <InfoField label="Data Início" value={formatDateBR(p.dt_inicio)} />
             </div>
           </Panel>
 
@@ -602,8 +636,221 @@ export function FichaProfessorPage() {
           )}
         </Panel>
       )}
+
+      {/* TAB: Licenças */}
+      {activeTab === "licencas" && (
+        <Panel>
+          <h2 className="mb-1 font-display text-xl font-semibold text-brand-dark">
+            Licenças
+          </h2>
+          <p className="mb-3 text-sm text-muted">
+            Histórico das licenças. Horários da mesma data aparecem agrupados. O
+            X inativa; exclusão permanente fica em Configuração → Licenças.
+          </p>
+          {licencas.length === 0 ? (
+            <EmptyState message="Nenhuma licença registrada para este professor." />
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-left text-sm">
+                <thead className="border-b border-border text-muted">
+                  <tr>
+                    <th className="px-2 py-2 font-medium">Situação</th>
+                    <th className="px-2 py-2 font-medium">Status</th>
+                    <th className="px-2 py-2 font-medium">Motivo</th>
+                    <th className="px-2 py-2 font-medium">Início</th>
+                    <th className="px-2 py-2 font-medium">Retorno previsto</th>
+                    <th className="px-2 py-2 font-medium">Encerrada em</th>
+                    <th className="px-2 py-2 font-medium">Escola</th>
+                    <th className="px-2 py-2 font-medium">Turmas</th>
+                    <th className="px-2 py-2 font-medium">Turnos</th>
+                    <th className="px-2 py-2 font-medium">Disc.</th>
+                    <th className="px-2 py-2 font-medium">Tempos</th>
+                    <th className="px-2 py-2 font-medium">Ações</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {agruparLicencas(licencas).map((l) => (
+                    <tr
+                      key={l.key}
+                      className={`border-b border-border/70 ${
+                        l.ativa ? "" : "bg-amber-50/70 text-muted"
+                      }`}
+                    >
+                      <td className="px-2 py-2 whitespace-nowrap">
+                        {l.ativa ? (
+                          <span className="inline-flex rounded-md bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-800 ring-1 ring-emerald-200">
+                            Ativa
+                          </span>
+                        ) : (
+                          <span
+                            className="inline-flex rounded-md bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-900 ring-1 ring-amber-200"
+                            title={
+                              l.inativado_em
+                                ? `Inativada em ${formatDateBR(String(l.inativado_em).slice(0, 10))}`
+                                : "Inativada"
+                            }
+                          >
+                            Inativa
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-2 py-2">
+                        <span
+                          className={`inline-flex rounded-md px-2 py-0.5 text-xs font-medium ${
+                            l.status === "ABERTA"
+                              ? "bg-fuchsia-100 text-fuchsia-900"
+                              : "bg-slate-100 text-slate-700"
+                          }`}
+                        >
+                          {STATUS_LICENCA_LABEL[l.status]}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2 max-w-[12rem]" title={l.motivo || undefined}>
+                        {l.motivo || "—"}
+                      </td>
+                      <td className="px-2 py-2 whitespace-nowrap">
+                        {formatDateBR(l.inicio)}
+                      </td>
+                      <td className="px-2 py-2 whitespace-nowrap">
+                        {formatDateBR(l.retorno_previsto)}
+                      </td>
+                      <td className="px-2 py-2 whitespace-nowrap">
+                        {formatDateBR(l.encerrada_em)}
+                      </td>
+                      <td className="px-2 py-2">{l.escolas || "—"}</td>
+                      <td className="px-2 py-2">{l.turmas || "—"}</td>
+                      <td className="px-2 py-2">{l.turnos || "—"}</td>
+                      <td className="px-2 py-2">{l.disciplinas || "—"}</td>
+                      <td className="px-2 py-2 whitespace-nowrap">{l.tempos}</td>
+                      <td className="px-2 py-2">
+                        {l.ativa ? (
+                          <IconCloseButton
+                            label="Inativar licença"
+                            title="Inativar"
+                            onClick={() =>
+                              setPendingInativarLicenca({
+                                ids: l.ids,
+                                label: `${formatDateBR(l.inicio)} → ${formatDateBR(l.retorno_previsto)} · ${l.tempos} tempo(s)`,
+                              })
+                            }
+                          />
+                        ) : (
+                          <span className="text-xs text-muted">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Panel>
+      )}
+
+      <ConfirmDialog
+        open={!!pendingInativarLicenca}
+        title="Inativar licença"
+        message={
+          pendingInativarLicenca
+            ? `Inativar a licença ${pendingInativarLicenca.label}? Ela fica no histórico como inativa. Para excluir de vez, use Configuração → Licenças.`
+            : ""
+        }
+        confirmLabel="Inativar"
+        loading={savingLicenca}
+        onConfirm={() => void confirmarInativarLicenca()}
+        onClose={() => {
+          if (!savingLicenca) setPendingInativarLicenca(null);
+        }}
+      />
     </div>
   );
+}
+
+function uniqueSorted(values: Array<string | null | undefined>): string[] {
+  return [...new Set(values.map((v) => String(v ?? "").trim()).filter(Boolean))].sort(
+    (a, b) => a.localeCompare(b, "pt-BR"),
+  );
+}
+
+/** Agrupa horários da mesma licença (mesmas datas/status/motivo/ativo) em uma linha. */
+function agruparLicencas(licencas: ProfessorLicenca[]) {
+  const groups = new Map<
+    string,
+    {
+      key: string;
+      ids: string[];
+      status: ProfessorLicenca["status"];
+      inicio: string;
+      retorno_previsto: string;
+      encerrada_em: string | null | undefined;
+      motivo: string | null | undefined;
+      inativado_em: string | null | undefined;
+      ativa: boolean;
+      escolas: string[];
+      turmas: string[];
+      turnos: string[];
+      disciplinas: string[];
+      tempos: number;
+    }
+  >();
+
+  for (const l of licencas) {
+    const ativa = isLicencaAtiva(l);
+    const key = [
+      l.status,
+      l.inicio,
+      l.retorno_previsto,
+      l.encerrada_em ?? "",
+      l.motivo ?? "",
+      ativa ? "1" : "0",
+    ].join("|");
+    const existing = groups.get(key);
+    if (!existing) {
+      groups.set(key, {
+        key,
+        ids: [l.id],
+        status: l.status,
+        inicio: l.inicio,
+        retorno_previsto: l.retorno_previsto,
+        encerrada_em: l.encerrada_em,
+        motivo: l.motivo,
+        inativado_em: l.inativado_em,
+        ativa,
+        escolas: uniqueSorted([l.escola_nome]),
+        turmas: uniqueSorted([l.turma_codigo]),
+        turnos: uniqueSorted([l.turno ? TURNO_LABEL[l.turno] : null]),
+        disciplinas: uniqueSorted([l.disciplina_codigo]),
+        tempos: 1,
+      });
+      continue;
+    }
+    existing.ids.push(l.id);
+    if (!existing.inativado_em && l.inativado_em) {
+      existing.inativado_em = l.inativado_em;
+    }
+    if (!existing.motivo && l.motivo) {
+      existing.motivo = l.motivo;
+    }
+    existing.escolas = uniqueSorted([...existing.escolas, l.escola_nome]);
+    existing.turmas = uniqueSorted([...existing.turmas, l.turma_codigo]);
+    existing.turnos = uniqueSorted([
+      ...existing.turnos,
+      l.turno ? TURNO_LABEL[l.turno] : null,
+    ]);
+    existing.disciplinas = uniqueSorted([
+      ...existing.disciplinas,
+      l.disciplina_codigo,
+    ]);
+    existing.tempos += 1;
+  }
+
+  return [...groups.values()].map((g) => ({
+    ...g,
+    escolas: g.escolas.join(" · "),
+    turmas: g.turmas.join(" · "),
+    turnos: g.turnos.join(" · "),
+    disciplinas: g.disciplinas.join(" · "),
+  }));
 }
 
 function InfoField({ label, value }: { label: string; value?: string | null }) {

@@ -14,7 +14,7 @@ import {
   EmptyState,
   ErrorBanner,
   Field,
-  IconDeleteButton,
+  IconCloseButton,
   IconEditButton,
   Modal,
   PageHeader,
@@ -25,6 +25,7 @@ import {
   inputClass,
 } from "@/components/ui";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { decodeSpreadsheetText } from "@/lib/textEncoding";
 import {
   TIPO_HE_LABEL,
@@ -306,6 +307,7 @@ function parseHoraExtraExcel(buffer: ArrayBuffer, fileName?: string) {
 }
 
 export function HoraExtraPage() {
+  const { isAdmin } = useAuth();
   const [itens, setItens] = useState<HoraExtra[]>([]);
   const [total, setTotal] = useState(0);
   const [professores, setProfessores] = useState<Professor[]>([]);
@@ -313,9 +315,9 @@ export function HoraExtraPage() {
   const [form, setForm] = useState(emptyForm);
   const [editing, setEditing] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
-  const [pendingDelete, setPendingDelete] = useState<HoraExtra | null>(null);
-  const [pendingDeleteAll, setPendingDeleteAll] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  const [pendingInativar, setPendingInativar] = useState<HoraExtra | null>(null);
+  const [pendingInativarTodas, setPendingInativarTodas] = useState(false);
+  const [inativando, setInativando] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -511,33 +513,37 @@ export function HoraExtraPage() {
     }
   }
 
-  async function confirmarExclusao() {
-    if (!pendingDelete) return;
-    setDeleting(true);
+  async function confirmarInativar() {
+    if (!pendingInativar) return;
+    setInativando(true);
     try {
-      await api(`/horas-extra/${pendingDelete.id}`, { method: "DELETE" });
-      setPendingDelete(null);
+      await api(`/horas-extra/${pendingInativar.id}/inativar`, {
+        method: "POST",
+      });
+      setPendingInativar(null);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Erro ao excluir");
-      setPendingDelete(null);
+      setError(err instanceof Error ? err.message : "Erro ao inativar");
+      setPendingInativar(null);
     } finally {
-      setDeleting(false);
+      setInativando(false);
     }
   }
 
-  async function confirmarExclusaoTudo() {
-    setDeleting(true);
+  async function confirmarInativarTodas() {
+    setInativando(true);
     try {
-      await api<{ deleted: number }>("/horas-extra", { method: "DELETE" });
-      setPendingDeleteAll(false);
+      await api<{ inativadas: number }>("/horas-extra/inativar-todas", {
+        method: "POST",
+      });
+      setPendingInativarTodas(false);
       setPage(1);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Erro ao excluir tudo");
-      setPendingDeleteAll(false);
+      setError(err instanceof Error ? err.message : "Erro ao inativar tudo");
+      setPendingInativarTodas(false);
     } finally {
-      setDeleting(false);
+      setInativando(false);
     }
   }
 
@@ -567,32 +573,40 @@ export function HoraExtraPage() {
     <div>
       <PageHeader
         title="Hora Extra"
-        description="Autorizações de tempos. O saldo é cruzado com as alocações pela matrícula."
+        description="Autorizações ativas de tempos. Inativar remove do relatório e mantém o histórico na ficha do professor."
         actions={
           <>
-            <input
-              ref={fileRef}
-              type="file"
-              accept=".xlsx,.xls,.csv"
-              className="hidden"
-              onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
-            />
-            <button
-              type="button"
-              className={btnDanger}
-              disabled={importing || deleting || (total === 0 && !busca.trim())}
-              onClick={() => setPendingDeleteAll(true)}
-            >
-              Apagar tudo
-            </button>
-            <button
-              type="button"
-              className={btnSecondary}
-              disabled={importing}
-              onClick={() => fileRef.current?.click()}
-            >
-              {importing ? "Importando..." : "Importar Excel"}
-            </button>
+            {isAdmin ? (
+              <>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept=".xlsx,.xls,.csv"
+                  className="hidden"
+                  onChange={(e) =>
+                    void onImportFile(e.target.files?.[0] ?? null)
+                  }
+                />
+                <button
+                  type="button"
+                  className={btnDanger}
+                  disabled={
+                    importing || inativando || (total === 0 && !busca.trim())
+                  }
+                  onClick={() => setPendingInativarTodas(true)}
+                >
+                  Inativar todas
+                </button>
+                <button
+                  type="button"
+                  className={btnSecondary}
+                  disabled={importing}
+                  onClick={() => fileRef.current?.click()}
+                >
+                  {importing ? "Importando..." : "Importar Excel"}
+                </button>
+              </>
+            ) : null}
             <button type="button" className={btnPrimary} onClick={abrirNova}>
               Nova HE
             </button>
@@ -643,6 +657,7 @@ export function HoraExtraPage() {
                     <th className="px-2 py-2 font-medium">Função</th>
                     <th className="px-2 py-2 font-medium">Tempos</th>
                     <th className="px-2 py-2 font-medium">Início</th>
+                    <th className="px-2 py-2 font-medium">Término</th>
                     <th className="px-2 py-2 font-medium">Tipo</th>
                     <th className="px-2 py-2 font-medium">Ações</th>
                   </tr>
@@ -670,6 +685,9 @@ export function HoraExtraPage() {
                       <td className="px-2 py-2 whitespace-nowrap">
                         {formatDateBR(h.inicio)}
                       </td>
+                      <td className="px-2 py-2 whitespace-nowrap">
+                        {formatDateBR(h.termino)}
+                      </td>
                       <td className="px-2 py-2">{TIPO_HE_LABEL[h.tipo]}</td>
                       <td className="px-2 py-2">
                         <div className="flex items-center gap-1">
@@ -677,9 +695,10 @@ export function HoraExtraPage() {
                             label={`Editar HE de ${h.professor_nome ?? h.matricula}`}
                             onClick={() => abrirEditar(h)}
                           />
-                          <IconDeleteButton
-                            label={`Excluir HE de ${h.professor_nome ?? h.matricula}`}
-                            onClick={() => setPendingDelete(h)}
+                          <IconCloseButton
+                            label={`Inativar HE de ${h.professor_nome ?? h.matricula}`}
+                            title="Inativar"
+                            onClick={() => setPendingInativar(h)}
                           />
                         </div>
                       </td>
@@ -1086,28 +1105,30 @@ export function HoraExtraPage() {
       </Modal>
 
       <ConfirmDialog
-        open={!!pendingDelete}
+        open={!!pendingInativar}
+        title="Inativar hora extra"
         message={
-          pendingDelete
-            ? `Excluir a hora extra de ${pendingDelete.professor_nome ?? pendingDelete.matricula} (${pendingDelete.tempos_autorizados} tempos)?`
+          pendingInativar
+            ? `Inativar a HE de ${pendingInativar.professor_nome ?? pendingInativar.matricula} (${pendingInativar.tempos_autorizados} tempos)? Ela sai deste relatório, mas permanece no histórico da ficha do professor.`
             : ""
         }
-        loading={deleting}
-        onConfirm={() => void confirmarExclusao()}
+        confirmLabel="Inativar"
+        loading={inativando}
+        onConfirm={() => void confirmarInativar()}
         onClose={() => {
-          if (!deleting) setPendingDelete(null);
+          if (!inativando) setPendingInativar(null);
         }}
       />
 
       <ConfirmDialog
-        open={pendingDeleteAll}
-        title="Apagar todas as HEs"
-        message="Isso vai excluir permanentemente TODAS as autorizações de hora extra do sistema (não só as da página ou do filtro atual). Esta ação não pode ser desfeita."
-        confirmLabel="Apagar tudo"
-        loading={deleting}
-        onConfirm={() => void confirmarExclusaoTudo()}
+        open={pendingInativarTodas}
+        title="Inativar todas as HEs"
+        message="Isso inativa TODAS as autorizações ativas de hora extra (não só as da página ou do filtro). Elas saem deste relatório e ficam só no histórico da ficha de cada professor."
+        confirmLabel="Inativar todas"
+        loading={inativando}
+        onConfirm={() => void confirmarInativarTodas()}
         onClose={() => {
-          if (!deleting) setPendingDeleteAll(false);
+          if (!inativando) setPendingInativarTodas(false);
         }}
       />
     </div>

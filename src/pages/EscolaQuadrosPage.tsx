@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 import {
   ConfirmDialog,
   EmptyState,
@@ -165,7 +165,10 @@ function MiniGrade({ quadro }: { quadro: Quadro }) {
 
 export function EscolaQuadrosPage() {
   const { escolaId } = useParams();
+  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const voltarLista =
+    (location.state as { from?: string } | null)?.from ?? "/carencias/doc1";
   const profFiltro = searchParams.get("prof");
   const disciplinaFiltro = searchParams.get("disciplina");
   const quadrosFiltro = searchParams.get("quadros")?.split(",").filter(Boolean) ?? [];
@@ -260,6 +263,23 @@ export function EscolaQuadrosPage() {
       return cmp * fator;
     });
   }, [quadros, sortKey, sortDir, quadrosFiltro, disciplinaFiltro]);
+
+  /** Quando há vários quadros iguais (turma+turno+disciplina), mostra #1, #2… */
+  const indiceDuplicata = useMemo(() => {
+    const groups = new Map<string, string[]>();
+    for (const q of quadros) {
+      const key = `${q.turma_codigo}|${q.turno}|${q.disciplina_id ?? ""}`;
+      const list = groups.get(key) ?? [];
+      list.push(q.id);
+      groups.set(key, list);
+    }
+    const map = new Map<string, number>();
+    for (const ids of groups.values()) {
+      if (ids.length < 2) continue;
+      ids.forEach((id, i) => map.set(id, i + 1));
+    }
+    return map;
+  }, [quadros]);
 
   function alternarOrdenacao(key: SortKey) {
     if (sortKey !== key) {
@@ -451,13 +471,13 @@ export function EscolaQuadrosPage() {
     <div>
       <PageHeader
         title={escola?.nome ?? "Escola"}
-        description="Cada card é um quadro de carência. Dá para incluir várias turmas no mesmo quadro."
+        description="Cada card é um quadro de carência. Pode criar vários da mesma turma e também juntar turmas num só quadro."
         actions={
           <>
             <button type="button" className={btnPrimary} onClick={abrirModal}>
               Novo quadro
             </button>
-            <Link to="/carencias/doc1" className={btnSecondary}>
+            <Link to={voltarLista} className={btnSecondary}>
               Voltar
             </Link>
           </>
@@ -550,6 +570,7 @@ export function EscolaQuadrosPage() {
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
           {quadrosOrdenados.map((q) => {
             const selecionado = selecionados.has(q.id);
+            const dup = indiceDuplicata.get(q.id);
             return (
               <Panel
                 key={q.id}
@@ -573,6 +594,11 @@ export function EscolaQuadrosPage() {
                           ? q.turmas
                           : [q.turma_codigo]
                         ).join(" · ")}
+                        {dup != null ? (
+                          <span className="ml-1.5 text-sm font-medium text-muted">
+                            #{dup}
+                          </span>
+                        ) : null}
                       </h2>
                       <p className="text-sm text-muted">
                         {TURNO_LABEL[q.turno]}
@@ -601,6 +627,7 @@ export function EscolaQuadrosPage() {
                 <div className="mt-auto flex items-center gap-2 pt-1">
                   <Link
                     to={`/carencias/doc1/${escolaId}/${q.id}`}
+                    state={{ from: `${location.pathname}${location.search}` }}
                     className={`${btnPrimary} flex-1`}
                   >
                     Abrir
@@ -740,8 +767,8 @@ export function EscolaQuadrosPage() {
                   ))}
                 </select>
                 <p className="mt-1 text-xs text-muted">
-                  Pode repetir as mesmas turmas e turno se a disciplina for outra
-                  (ex.: Manhã · ART e Manhã · MAT).
+                  Pode criar mais de um quadro com as mesmas turmas, turno e
+                  disciplina (ex.: dois quadros da 611 Manhã · PT).
                 </p>
               </Field>
               <div className="flex justify-end gap-2 pt-2">

@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import {
   ConfirmDialog,
   EmptyState,
@@ -14,6 +14,7 @@ import {
   inputClass,
 } from "@/components/ui";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { parseCarenciasPlanilha } from "@/lib/importCarenciasPlanilha";
 import type { Escola } from "@/lib/types";
 
@@ -43,6 +44,8 @@ type ProfessorAlocado = {
 };
 
 export function CarenciasPage() {
+  const { isAdmin } = useAuth();
+  const location = useLocation();
   const [escolas, setEscolas] = useState<Resumo[]>([]);
   const [disponiveis, setDisponiveis] = useState<Escola[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -250,32 +253,40 @@ export function CarenciasPage() {
 
   return (
     <div>
+      <div className="mb-3">
+        <Link to="/carencias" className={btnSecondary}>
+          ← Voltar
+        </Link>
+      </div>
       <PageHeader
         title="Carências - DOC I"
-        description="Professor Docente I - Anos Iniciais. Só aparecem aqui as escolas que você adicionar. Dá para importar a planilha de carências (grade por escola/turno) ou incluir uma a uma."
+        description="Professor Docente I - Anos Iniciais. Inclua escolas uma a uma ou importe a planilha de carências (grade por escola/turno)."
         actions={
           <>
-            <Link to="/carencias" className={btnSecondary}>
-              Voltar
-            </Link>
-            <input
-              ref={fileRef}
-              type="file"
-              accept=".xlsx,.xls"
-              className="hidden"
-              onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
-            />
+            {isAdmin ? (
+              <>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept=".xlsx,.xls"
+                  className="hidden"
+                  onChange={(e) =>
+                    void onImportFile(e.target.files?.[0] ?? null)
+                  }
+                />
+                <button
+                  type="button"
+                  className={`${btnSecondary} w-full sm:w-auto`}
+                  disabled={importing}
+                  onClick={() => fileRef.current?.click()}
+                >
+                  {importing ? "Importando..." : "Importar Excel"}
+                </button>
+              </>
+            ) : null}
             <button
               type="button"
-              className={btnSecondary}
-              disabled={importing}
-              onClick={() => fileRef.current?.click()}
-            >
-              {importing ? "Importando..." : "Importar Excel"}
-            </button>
-            <button
-              type="button"
-              className={btnPrimary}
+              className={`${btnPrimary} w-full sm:w-auto`}
               onClick={() => void abrirModal()}
             >
               Adicionar escola
@@ -514,14 +525,20 @@ export function CarenciasPage() {
                   ) : null}
                 </div>
                 <div className="mt-auto flex flex-wrap items-center gap-2">
-                  <Link to={linkTo} className={btnPrimary}>
+                  <Link
+                    to={linkTo}
+                    state={{ from: `${location.pathname}${location.search}` }}
+                    className={btnPrimary}
+                  >
                     Ver turmas / quadros
                   </Link>
-                  <IconDeleteButton
-                    title="Remover"
-                    label={`Remover ${e.nome} das carências`}
-                    onClick={() => setPendingRemove(e)}
-                  />
+                  {isAdmin ? (
+                    <IconDeleteButton
+                      title="Remover"
+                      label={`Remover ${e.nome} das carências`}
+                      onClick={() => setPendingRemove(e)}
+                    />
+                  ) : null}
                 </div>
               </Panel>
             );

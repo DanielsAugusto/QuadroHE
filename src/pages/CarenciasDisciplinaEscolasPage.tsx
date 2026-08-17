@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router-dom";
 import {
   EmptyState,
   ErrorBanner,
@@ -93,6 +93,7 @@ function MiniGrade({ quadro }: { quadro: Pick<Quadro, "turno" | "slots_preview">
 
 export function CarenciasDisciplinaEscolasPage() {
   const { disciplinaId } = useParams();
+  const location = useLocation();
   const [disciplinas, setDisciplinas] = useState<DisciplinaResumo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -157,7 +158,13 @@ export function CarenciasDisciplinaEscolasPage() {
         }
         actions={
           <>
-            <Link to="/carencias/doc1/disciplinas" className={btnSecondary}>
+            <Link
+              to={
+                (location.state as { from?: string } | null)?.from ??
+                "/carencias/doc1/disciplinas"
+              }
+              className={btnSecondary}
+            >
               Voltar às disciplinas
             </Link>
             <Link to="/carencias/doc1" className={btnSecondary}>
@@ -243,6 +250,7 @@ export function CarenciasDisciplinaEscolasPage() {
                 <div className="mt-auto pt-1">
                   <Link
                     to={`/carencias/doc1/${q.escola_id}/${q.id}`}
+                    state={{ from: `${location.pathname}${location.search}` }}
                     className={`${btnPrimary} w-full`}
                   >
                     Abrir

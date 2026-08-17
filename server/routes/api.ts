@@ -1,7 +1,10 @@
 import { Router, type Request } from "express";
 import { v4 as uuid } from "uuid";
+import { writeAuditLog } from "../audit.js";
 import { db } from "../db.js";
-import { requireAuth } from "../auth.js";
+import { requireAdmin, requireAuth } from "../auth.js";
+import { clientErrorMessage } from "../httpErrors.js";
+import { inativarHorasExtraExpiradas } from "../heExpiry.js";
 import {
   hydrateQuadroRow,
   normalizeTurmas,
@@ -15,6 +18,14 @@ import {
 
 export const apiRouter = Router();
 apiRouter.use(requireAuth);
+
+function parseTipoHe(raw: unknown): "REAL" | "TEMPORARIA" | null {
+  const t = String(raw ?? "REAL")
+    .trim()
+    .toUpperCase();
+  if (t === "REAL" || t === "TEMPORARIA") return t;
+  return null;
+}
 
 /** Cache curto do mapão / contagens (TTL + invalidação em mutações). */
 const lotacaoContagensCache = new Map<string, { at: number; data: unknown }>();
@@ -97,6 +108,8 @@ apiRouter.get("/professores/:matricula", (req, res) => {
     .get(req.params.matricula);
   if (!professor) return res.status(404).json({ error: "Não encontrado" });
 
+  inativarHorasExtraExpiradas(req);
+
   const horas_extra = db
     .prepare(
       `select h.*, d.nome as disciplina_nome, d.codigo as disciplina_codigo
@@ -141,7 +154,18 @@ apiRouter.get("/professores/:matricula", (req, res) => {
     )
     .all(req.params.matricula);
 
-  res.json({ professor, horas_extra, alocacoes, slots, lotacoes });
+  const licencas = db
+    .prepare(
+      `select * from professor_licencas
+       where matricula = ?
+       order by
+         case when status = 'ABERTA' then 0 else 1 end,
+         inicio desc,
+         created_at desc`,
+    )
+    .all(req.params.matricula);
+
+  res.json({ professor, horas_extra, alocacoes, slots, lotacoes, licencas });
 });
 
 apiRouter.post("/professores", (req, res) => {
@@ -162,13 +186,21 @@ apiRouter.post("/professores", (req, res) => {
       .prepare("select * from professores where matricula = ?")
       .get(matricula);
     invalidateLotacaoContagensCache();
+    writeAuditLog({
+      req,
+      categoria: "professores",
+      acao: "criar",
+      entidade: "professores",
+      entidade_id: matricula,
+      resumo: `Cadastrou professor ${nome} (${matricula})`,
+    });
     return res.status(201).json(row);
   } catch {
     return res.status(409).json({ error: "Matrícula já cadastrada" });
   }
 });
 
-apiRouter.post("/professores/import", (req, res) => {
+apiRouter.post("/professores/import", requireAdmin, (req, res) => {
   const itens = Array.isArray(req.body?.itens) ? req.body.itens : null;
   if (!itens || itens.length === 0) {
     return res.status(400).json({ error: "Nenhum registro para importar" });
@@ -337,11 +369,19 @@ apiRouter.post("/professores/import", (req, res) => {
       /* ignore */
     }
     return res.status(500).json({
-      error: err instanceof Error ? err.message : "Erro ao importar",
+      error: clientErrorMessage(err, "Erro ao importar"),
     });
   }
 
   invalidateLotacaoContagensCache();
+  writeAuditLog({
+    req,
+    categoria: "professores",
+    acao: "importar",
+    entidade: "professores",
+    resumo: `Importou professores: ${criados} criados, ${atualizados} atualizados, ${lotacoes} lotações`,
+    detalhes: { criados, atualizados, lotacoes, ignorados, erros: erros.length },
+  });
   return res.json({ criados, atualizados, lotacoes, ignorados, erros });
 });
 
@@ -365,16 +405,35 @@ apiRouter.put("/professores/:matricula", (req, res) => {
     .prepare("select * from professores where matricula = ?")
     .get(req.params.matricula);
   invalidateLotacaoContagensCache();
+  writeAuditLog({
+    req,
+    categoria: "professores",
+    acao: "editar",
+    entidade: "professores",
+    entidade_id: req.params.matricula,
+    resumo: `Editou professor ${nome} (${req.params.matricula})`,
+  });
   return res.json(row);
 });
 
-apiRouter.delete("/professores", (_req, res) => {
+apiRouter.delete("/professores", requireAdmin, (req, res) => {
   const result = db.prepare("delete from professores").run();
   invalidateLotacaoContagensCache();
+  writeAuditLog({
+    req,
+    categoria: "professores",
+    acao: "excluir",
+    entidade: "professores",
+    resumo: `Apagou todos os professores (${result.changes})`,
+    detalhes: { deleted: Number(result.changes) },
+  });
   return res.json({ deleted: Number(result.changes) });
 });
 
-apiRouter.delete("/professores/:matricula", (req, res) => {
+apiRouter.delete("/professores/:matricula", requireAdmin, (req, res) => {
+  const before = db
+    .prepare("select matricula, nome from professores where matricula = ?")
+    .get(req.params.matricula) as { matricula: string; nome: string } | undefined;
   const result = db
     .prepare("delete from professores where matricula = ?")
     .run(req.params.matricula);
@@ -382,6 +441,14 @@ apiRouter.delete("/professores/:matricula", (req, res) => {
     return res.status(404).json({ error: "Não encontrado" });
   }
   invalidateLotacaoContagensCache();
+  writeAuditLog({
+    req,
+    categoria: "professores",
+    acao: "excluir",
+    entidade: "professores",
+    entidade_id: req.params.matricula,
+    resumo: `Apagou professor ${before?.nome ?? req.params.matricula} (${req.params.matricula})`,
+  });
   return res.status(204).send();
 });
 
@@ -1386,7 +1453,7 @@ apiRouter.get("/carencias/professores-alocados", (_req, res) => {
  * horários em conflito (mesma célula, turmas diferentes) vão para
  * quadro residual só daquela turma.
  */
-apiRouter.post("/carencias/import", (req, res) => {
+apiRouter.post("/carencias/import", requireAdmin, (req, res) => {
   const itens = Array.isArray(req.body?.itens) ? req.body.itens : null;
   if (!itens || itens.length === 0) {
     return res.status(400).json({ error: "Nenhum registro para importar" });
@@ -1679,7 +1746,7 @@ apiRouter.post("/carencias/import", (req, res) => {
       /* ignore */
     }
     return res.status(500).json({
-      error: err instanceof Error ? err.message : "Erro ao importar",
+      error: clientErrorMessage(err, "Erro ao importar"),
     });
   }
 
@@ -1712,7 +1779,7 @@ apiRouter.post("/escolas", (req, res) => {
   }
 });
 
-apiRouter.post("/escolas/import", (req, res) => {
+apiRouter.post("/escolas/import", requireAdmin, (req, res) => {
   const itens = Array.isArray(req.body?.itens) ? req.body.itens : null;
   if (!itens || itens.length === 0) {
     return res.status(400).json({ error: "Nenhum registro para importar" });
@@ -1753,7 +1820,7 @@ apiRouter.post("/escolas/import", (req, res) => {
       /* ignore */
     }
     return res.status(500).json({
-      error: err instanceof Error ? err.message : "Erro ao importar",
+      error: clientErrorMessage(err, "Erro ao importar"),
     });
   }
 
@@ -1779,30 +1846,64 @@ apiRouter.put("/escolas/:id", (req, res) => {
 });
 
 apiRouter.patch("/escolas/:id/carencias", (req, res) => {
-  const ativa = Boolean(req.body?.ativa);
+  const rawAtiva = req.body?.ativa;
+  const ativa =
+    rawAtiva === true ||
+    rawAtiva === 1 ||
+    rawAtiva === "1" ||
+    String(rawAtiva).toLowerCase() === "true";
+  if (!ativa && req.user?.papel !== "admin") {
+    writeAuditLog({
+      req,
+      categoria: "sistema",
+      acao: "authz_negada",
+      entidade: "escolas",
+      entidade_id: String(req.params.id),
+      resumo: `Acesso administrativo recusado para ${req.user?.email ?? "desconhecido"}`,
+      detalhes: { rota: req.originalUrl, metodo: req.method },
+    });
+    return res.status(403).json({
+      error: "Apenas administradores podem remover escola das carências",
+    });
+  }
+
+  const escolaId = String(req.params.id);
   const escola = db
-    .prepare("select id from escolas where id = ?")
-    .get(req.params.id);
+    .prepare("select id, nome from escolas where id = ?")
+    .get(escolaId) as { id: string; nome: string } | undefined;
   if (!escola) {
     return res.status(404).json({ error: "Não encontrado" });
   }
 
   if (!ativa) {
     // Sai da lista de carências: apaga quadros (slots caem em cascade)
-    db.prepare("delete from quadros where escola_id = ?").run(req.params.id);
+    db.prepare("delete from quadros where escola_id = ?").run(escolaId);
   }
 
   db.prepare("update escolas set em_carencias = ? where id = ?").run(
     ativa ? 1 : 0,
-    req.params.id,
+    escolaId,
   );
 
+  writeAuditLog({
+    req,
+    categoria: "carencia",
+    acao: ativa ? "reativar" : "remover",
+    entidade: "escolas",
+    entidade_id: escolaId,
+    resumo: ativa
+      ? `Incluiu escola ${escola.nome} nas carências`
+      : `Removeu escola ${escola.nome} das carências (quadros apagados)`,
+  });
+
+  invalidateCarenciasContagensCache();
+
   return res.json(
-    db.prepare("select * from escolas where id = ?").get(req.params.id),
+    db.prepare("select * from escolas where id = ?").get(escolaId),
   );
 });
 
-apiRouter.delete("/escolas/:id", (req, res) => {
+apiRouter.delete("/escolas/:id", requireAdmin, (req, res) => {
   const result = db
     .prepare("delete from escolas where id = ?")
     .run(req.params.id);
@@ -1865,7 +1966,7 @@ apiRouter.put("/disciplinas/:id", (req, res) => {
   }
 });
 
-apiRouter.delete("/disciplinas/:id", (req, res) => {
+apiRouter.delete("/disciplinas/:id", requireAdmin, (req, res) => {
   const result = db
     .prepare("delete from disciplinas where id = ?")
     .run(req.params.id);
@@ -1877,19 +1978,35 @@ apiRouter.delete("/disciplinas/:id", (req, res) => {
 
 // Hora Extra
 apiRouter.get("/horas-extra", (req, res) => {
+  inativarHorasExtraExpiradas(req);
   const { paginated, page, pageSize, offset, like } = listQuery(req);
+  const incluirInativas =
+    req.query.incluir_inativas === "1" ||
+    req.query.incluir_inativas === "true" ||
+    req.query.incluir_inativas === "sim";
+  const statusFiltro = String(req.query.status ?? "")
+    .trim()
+    .toLowerCase();
 
-  let where = "";
+  const clauses: string[] = [];
   const params: string[] = [];
+  if (statusFiltro === "ativas") {
+    clauses.push("ifnull(h.ativo, 1) = 1");
+  } else if (statusFiltro === "inativas") {
+    clauses.push("ifnull(h.ativo, 1) = 0");
+  } else if (!incluirInativas) {
+    clauses.push("ifnull(h.ativo, 1) = 1");
+  }
   if (like) {
-    where = ` where h.matricula like ? collate nocase
+    clauses.push(`(h.matricula like ? collate nocase
       or ifnull(p.nome,'') like ? collate nocase
       or ifnull(h.memo,'') like ? collate nocase
       or ifnull(h.observacao,'') like ? collate nocase
       or ifnull(h.lotacao_origem,'') like ? collate nocase
-      or h.tipo like ? collate nocase`;
+      or h.tipo like ? collate nocase)`);
     params.push(like, like, like, like, like, like);
   }
+  const where = clauses.length ? ` where ${clauses.join(" and ")}` : "";
 
   const baseFrom = `from horas_extra h
        left join professores p on p.matricula = h.matricula
@@ -1949,6 +2066,10 @@ apiRouter.post("/horas-extra", (req, res) => {
       .status(400)
       .json({ error: "Matrícula, funcionário e nº de tempos são obrigatórios" });
   }
+  const tipo = parseTipoHe(req.body?.tipo || "REAL");
+  if (!tipo) {
+    return res.status(400).json({ error: "Tipo inválido" });
+  }
 
   const id = uuid();
   try {
@@ -1972,7 +2093,7 @@ apiRouter.post("/horas-extra", (req, res) => {
       matricula,
       req.body?.disciplina_id || null,
       tempos,
-      req.body?.tipo || "REAL",
+      tipo,
       req.body?.inicio || null,
       req.body?.termino || null,
       String(req.body?.memo ?? "").trim() || null,
@@ -1982,17 +2103,26 @@ apiRouter.post("/horas-extra", (req, res) => {
       cargo,
       funcao,
     );
+    writeAuditLog({
+      req,
+      categoria: "hora_extra",
+      acao: "criar",
+      entidade: "horas_extra",
+      entidade_id: id,
+      resumo: `Cadastrou HE de ${nome} (${matricula}) — ${tempos} ${unidade.toLowerCase()}`,
+      detalhes: { matricula, tempos, unidade, tipo: req.body?.tipo || "REAL" },
+    });
     return res.status(201).json(
       db.prepare("select * from horas_extra where id = ?").get(id),
     );
   } catch (err) {
     return res.status(400).json({
-      error: err instanceof Error ? err.message : "Erro ao salvar",
+      error: clientErrorMessage(err, "Erro ao salvar"),
     });
   }
 });
 
-apiRouter.post("/horas-extra/import", (req, res) => {
+apiRouter.post("/horas-extra/import", requireAdmin, (req, res) => {
   const itens = Array.isArray(req.body?.itens) ? req.body.itens : null;
   if (!itens || itens.length === 0) {
     return res.status(400).json({ error: "Nenhum registro para importar" });
@@ -2098,10 +2228,18 @@ apiRouter.post("/horas-extra/import", (req, res) => {
       /* ignore */
     }
     return res.status(500).json({
-      error: err instanceof Error ? err.message : "Erro ao importar",
+      error: clientErrorMessage(err, "Erro ao importar"),
     });
   }
 
+  writeAuditLog({
+    req,
+    categoria: "hora_extra",
+    acao: "importar",
+    entidade: "horas_extra",
+    resumo: `Importou HEs: ${criados} criadas, ${ignorados} ignoradas`,
+    detalhes: { criados, ignorados, erros: erros.length },
+  });
   return res.json({ criados, atualizados: 0, ignorados, erros });
 });
 
@@ -2122,6 +2260,10 @@ apiRouter.put("/horas-extra/:id", (req, res) => {
     return res
       .status(400)
       .json({ error: "Matrícula, funcionário e nº de tempos são obrigatórios" });
+  }
+  const tipo = parseTipoHe(req.body?.tipo || "REAL");
+  if (!tipo) {
+    return res.status(400).json({ error: "Tipo inválido" });
   }
 
   try {
@@ -2148,7 +2290,7 @@ apiRouter.put("/horas-extra/:id", (req, res) => {
         matricula,
         req.body?.disciplina_id || null,
         tempos,
-        req.body?.tipo || "REAL",
+        tipo,
         req.body?.inicio || null,
         req.body?.termino || null,
         String(req.body?.memo ?? "").trim() || null,
@@ -2167,22 +2309,198 @@ apiRouter.put("/horas-extra/:id", (req, res) => {
     );
   } catch (err) {
     return res.status(400).json({
-      error: err instanceof Error ? err.message : "Erro ao salvar",
+      error: clientErrorMessage(err, "Erro ao salvar"),
     });
   }
 });
 
-apiRouter.delete("/horas-extra", (_req, res) => {
+/** Inativa todas as HEs ativas (permanecem no histórico do professor). */
+apiRouter.post("/horas-extra/inativar-todas", requireAdmin, (req, res) => {
+  const result = db
+    .prepare(
+      `update horas_extra
+       set ativo = 0,
+           inativado_em = datetime('now'),
+           updated_at = datetime('now')
+       where ifnull(ativo, 1) = 1`,
+    )
+    .run();
+  writeAuditLog({
+    req,
+    categoria: "hora_extra",
+    acao: "inativar",
+    entidade: "horas_extra",
+    resumo: `Inativou todas as HEs ativas (${result.changes})`,
+    detalhes: { inativadas: Number(result.changes) },
+  });
+  return res.json({ inativadas: Number(result.changes) });
+});
+
+apiRouter.post("/horas-extra/:id/inativar", (req, res) => {
+  const before = db
+    .prepare(
+      `select h.id, h.matricula, h.tempos_autorizados, p.nome as professor_nome
+       from horas_extra h
+       left join professores p on p.matricula = h.matricula
+       where h.id = ?`,
+    )
+    .get(req.params.id) as
+    | {
+        id: string;
+        matricula: string;
+        tempos_autorizados: number;
+        professor_nome: string | null;
+      }
+    | undefined;
+
+  const result = db
+    .prepare(
+      `update horas_extra
+       set ativo = 0,
+           inativado_em = datetime('now'),
+           updated_at = datetime('now')
+       where id = ? and ifnull(ativo, 1) = 1`,
+    )
+    .run(req.params.id);
+  if (result.changes === 0) {
+    const exists = db
+      .prepare("select id, ativo from horas_extra where id = ?")
+      .get(req.params.id) as { id: string; ativo: number } | undefined;
+    if (!exists) return res.status(404).json({ error: "Não encontrado" });
+    return res.json(exists);
+  }
+  if (before) {
+    writeAuditLog({
+      req,
+      categoria: "hora_extra",
+      acao: "inativar",
+      entidade: "horas_extra",
+      entidade_id: before.id,
+      resumo: `Inativou HE de ${before.professor_nome ?? before.matricula} (${before.matricula}) — ${before.tempos_autorizados} tempos`,
+    });
+  }
+  return res.json(
+    db.prepare("select * from horas_extra where id = ?").get(req.params.id),
+  );
+});
+
+apiRouter.post("/horas-extra/:id/reativar", (req, res) => {
+  const semTermino =
+    req.body?.sem_termino === true || req.body?.termino === null;
+  let termino: string | null = null;
+
+  if (!semTermino) {
+    termino = String(req.body?.termino ?? "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(termino)) {
+      return res.status(400).json({
+        error:
+          "Informe a nova data de término (AAAA-MM-DD) ou marque sem data de término",
+      });
+    }
+    const hoje = new Date();
+    const today = `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, "0")}-${String(hoje.getDate()).padStart(2, "0")}`;
+    if (termino < today) {
+      return res.status(400).json({
+        error: "A data de término deve ser hoje ou uma data futura",
+      });
+    }
+  }
+
+  const before = db
+    .prepare(
+      `select h.id, h.matricula, h.tempos_autorizados, h.termino, p.nome as professor_nome
+       from horas_extra h
+       left join professores p on p.matricula = h.matricula
+       where h.id = ?`,
+    )
+    .get(req.params.id) as
+    | {
+        id: string;
+        matricula: string;
+        tempos_autorizados: number;
+        termino: string | null;
+        professor_nome: string | null;
+      }
+    | undefined;
+
+  if (!before) {
+    return res.status(404).json({ error: "Não encontrado" });
+  }
+
+  const result = db
+    .prepare(
+      `update horas_extra
+       set ativo = 1,
+           termino = ?,
+           inativado_em = null,
+           updated_at = datetime('now')
+       where id = ?`,
+    )
+    .run(termino, req.params.id);
+  if (result.changes === 0) {
+    return res.status(404).json({ error: "Não encontrado" });
+  }
+  writeAuditLog({
+    req,
+    categoria: "hora_extra",
+    acao: "reativar",
+    entidade: "horas_extra",
+    entidade_id: before.id,
+    resumo: `Reativou HE de ${before.professor_nome ?? before.matricula} (${before.matricula}) — ${before.tempos_autorizados} tempos · ${
+      termino ? `término ${termino}` : "sem data de término"
+    }`,
+    detalhes: { termino_anterior: before.termino, termino_novo: termino },
+  });
+  return res.json(
+    db.prepare("select * from horas_extra where id = ?").get(req.params.id),
+  );
+});
+
+/** Exclusão permanente (uso excepcional). Preferir inativar. */
+apiRouter.delete("/horas-extra", requireAdmin, (req, res) => {
   const result = db.prepare("delete from horas_extra").run();
+  writeAuditLog({
+    req,
+    categoria: "hora_extra",
+    acao: "excluir",
+    entidade: "horas_extra",
+    resumo: `Apagou todas as HEs (${result.changes})`,
+    detalhes: { deleted: Number(result.changes) },
+  });
   return res.json({ deleted: Number(result.changes) });
 });
 
-apiRouter.delete("/horas-extra/:id", (req, res) => {
+apiRouter.delete("/horas-extra/:id", requireAdmin, (req, res) => {
+  const before = db
+    .prepare(
+      `select h.id, h.matricula, h.tempos_autorizados, p.nome as professor_nome
+       from horas_extra h
+       left join professores p on p.matricula = h.matricula
+       where h.id = ?`,
+    )
+    .get(req.params.id) as
+    | {
+        id: string;
+        matricula: string;
+        tempos_autorizados: number;
+        professor_nome: string | null;
+      }
+    | undefined;
   const result = db
     .prepare("delete from horas_extra where id = ?")
     .run(req.params.id);
   if (result.changes === 0) {
     return res.status(404).json({ error: "Não encontrado" });
+  }
+  if (before) {
+    writeAuditLog({
+      req,
+      categoria: "hora_extra",
+      acao: "excluir",
+      entidade: "horas_extra",
+      entidade_id: before.id,
+      resumo: `Apagou HE de ${before.professor_nome ?? before.matricula} (${before.matricula}) — ${before.tempos_autorizados} tempos`,
+    });
   }
   return res.status(204).send();
 });
@@ -2231,7 +2549,7 @@ apiRouter.post("/alocacoes", (req, res) => {
       .json(db.prepare("select * from alocacoes where id = ?").get(id));
   } catch (err) {
     return res.status(400).json({
-      error: err instanceof Error ? err.message : "Erro ao salvar",
+      error: clientErrorMessage(err, "Erro ao salvar"),
     });
   }
 });
@@ -2267,7 +2585,7 @@ apiRouter.put("/alocacoes/:id", (req, res) => {
     );
   } catch (err) {
     return res.status(400).json({
-      error: err instanceof Error ? err.message : "Erro ao salvar",
+      error: clientErrorMessage(err, "Erro ao salvar"),
     });
   }
 });
@@ -2338,27 +2656,18 @@ apiRouter.post("/escolas/:id/quadros", (req, res) => {
   const turma_codigo = turmaLabel(turmas);
   const turmas_json = JSON.stringify(turmas);
   const id = uuid();
-  try {
-    db.prepare(
-      `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
-       values (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      id,
-      escola_id,
-      turma_codigo,
-      turno,
-      disciplina_id,
-      observacao,
-      turmas_json,
-    );
-  } catch {
-    return res
-      .status(409)
-      .json({
-        error:
-          "Já existe quadro para estas turmas, turno e disciplina nesta escola",
-      });
-  }
+  db.prepare(
+    `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
+     values (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    escola_id,
+    turma_codigo,
+    turno,
+    disciplina_id,
+    observacao,
+    turmas_json,
+  );
 
   return res.status(201).json(
     hydrateQuadroRow(
@@ -2372,52 +2681,72 @@ apiRouter.post("/escolas/:id/quadros", (req, res) => {
 
 apiRouter.put("/quadros/:id", (req, res) => {
   const turmasRaw = req.body?.turmas;
-  const turmas: string[] = Array.isArray(turmasRaw)
-    ? turmasRaw.map((t: unknown) => String(t).trim()).filter(Boolean)
-    : [];
+  const turmasBody = Array.isArray(turmasRaw) ? turmasRaw : null;
   const turma_codigo_legacy = String(req.body?.turma_codigo ?? "").trim();
   const turno = String(req.body?.turno ?? "");
   const disciplina_id = req.body?.disciplina_id || null;
   const observacao = String(req.body?.observacao ?? "").trim() || null;
 
-  const turma_codigo = turmas.length > 0 ? turmas[0] : turma_codigo_legacy;
-  const turmas_json = turmas.length > 0 ? JSON.stringify(turmas) : null;
-
-  if (!turma_codigo) {
+  const turmas = normalizeTurmas(
+    turmasBody ?? (turma_codigo_legacy ? [turma_codigo_legacy] : []),
+  );
+  if (turmas.length === 0) {
     return res.status(400).json({ error: "Informe ao menos uma turma" });
   }
   if (!["MANHA", "TARDE", "NOITE"].includes(turno)) {
     return res.status(400).json({ error: "Turno inválido" });
   }
 
-  try {
-    const result = db
-      .prepare(
-        `update quadros set turma_codigo = ?, turno = ?, disciplina_id = ?,
-         observacao = ?, turmas_json = ?, updated_at = datetime('now')
-         where id = ?`,
-      )
-      .run(turma_codigo, turno, disciplina_id, observacao, turmas_json, req.params.id);
-    if (result.changes === 0) {
-      return res.status(404).json({ error: "Quadro não encontrado" });
-    }
-  } catch {
-    return res
-      .status(409)
-      .json({
-        error:
-          "Já existe quadro para esta turma, turno e disciplina nesta escola",
-      });
-  }
+  const turma_codigo = turmaLabel(turmas);
+  const turmas_json = JSON.stringify(turmas);
 
-  return res.json(db.prepare("select * from quadros where id = ?").get(req.params.id));
-});
-
-apiRouter.delete("/quadros/:id", (req, res) => {
-  const result = db.prepare("delete from quadros where id = ?").run(req.params.id);
+  const result = db
+    .prepare(
+      `update quadros set turma_codigo = ?, turno = ?, disciplina_id = ?,
+       observacao = ?, turmas_json = ?, updated_at = datetime('now')
+       where id = ?`,
+    )
+    .run(turma_codigo, turno, disciplina_id, observacao, turmas_json, req.params.id);
   if (result.changes === 0) {
     return res.status(404).json({ error: "Quadro não encontrado" });
   }
+
+  return res.json(
+    hydrateQuadroRow(
+      db.prepare("select * from quadros where id = ?").get(req.params.id) as Record<
+        string,
+        unknown
+      >,
+    ),
+  );
+});
+
+apiRouter.delete("/quadros/:id", (req, res) => {
+  // Operadores podem apagar quadro individual (fluxo diário); exclusões
+  // em massa (escola das carências, etc.) ficam restritas a admin.
+  const quadroId = String(req.params.id);
+  const quadro = db
+    .prepare(
+      `select q.id, q.turma_codigo, e.nome as escola_nome
+       from quadros q
+       join escolas e on e.id = q.escola_id
+       where q.id = ?`,
+    )
+    .get(quadroId) as
+    | { id: string; turma_codigo: string; escola_nome: string }
+    | undefined;
+  if (!quadro) {
+    return res.status(404).json({ error: "Quadro não encontrado" });
+  }
+  db.prepare("delete from quadros where id = ?").run(quadroId);
+  writeAuditLog({
+    req,
+    categoria: "quadros",
+    acao: "excluir",
+    entidade: "quadro",
+    entidade_id: quadroId,
+    resumo: `Excluiu quadro ${quadro.turma_codigo} · ${quadro.escola_nome}`,
+  });
   invalidateCarenciasContagensCache();
   return res.status(204).send();
 });
@@ -2477,29 +2806,18 @@ apiRouter.post("/escolas/:id/quadros/lote", (req, res) => {
   const turmas_json = JSON.stringify(turmas);
   const id = uuid();
 
-  try {
-    db.prepare(
-      `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
-       values (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      id,
-      escola_id,
-      turma_codigo,
-      turno,
-      disciplina_id,
-      observacao,
-      turmas_json,
-    );
-  } catch {
-    return res.status(409).json({
-      error:
-        "Já existe quadro para estas turmas, turno e disciplina nesta escola",
-      ignorados: turmas,
-      erros: [
-        "Já existe quadro para estas turmas, turno e disciplina nesta escola",
-      ],
-    });
-  }
+  db.prepare(
+    `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
+     values (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    escola_id,
+    turma_codigo,
+    turno,
+    disciplina_id,
+    observacao,
+    turmas_json,
+  );
 
   const criado = hydrateQuadroRow(
     db.prepare("select * from quadros where id = ?").get(id) as Record<
@@ -2593,6 +2911,15 @@ apiRouter.put("/quadros/:id/slots", (req, res) => {
         });
       }
       db.prepare("delete from quadro_slots where id = ?").run(existing.id);
+      writeAuditLog({
+        req,
+        categoria: "carencia",
+        acao: "remover",
+        entidade: "quadro_slots",
+        entidade_id: existing.id,
+        resumo: `Removeu carência do quadro (dia ${dia}, ${periodo}ª) — turma ${turmaSlot || quadro.turma_codigo}`,
+        detalhes: { quadro_id, dia, periodo },
+      });
     }
     return res.json({ removed: true });
   }
@@ -2603,6 +2930,16 @@ apiRouter.put("/quadros/:id/slots", (req, res) => {
        set tipo = ?, expira_em = ?, turma_codigo = ?, modalidade_cobertura = ?, updated_at = datetime('now')
        where id = ?`,
     ).run(tipo, expira_em, turmaSlot, modalidade_cobertura, existing.id);
+
+    writeAuditLog({
+      req,
+      categoria: "carencia",
+      acao: "editar",
+      entidade: "quadro_slots",
+      entidade_id: existing.id,
+      resumo: `Atualizou carência (dia ${dia}, ${periodo}ª) — turma ${turmaSlot}${modalidade_cobertura ? ` · ${modalidade_cobertura}` : ""}`,
+      detalhes: { quadro_id, dia, periodo, tipo, modalidade_cobertura },
+    });
 
     return res.json(
       db
@@ -2621,6 +2958,16 @@ apiRouter.put("/quadros/:id/slots", (req, res) => {
     `insert into quadro_slots (id, quadro_id, dia, periodo, tipo, expira_em, turma_codigo, modalidade_cobertura)
      values (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(id, quadro_id, dia, periodo, tipo, expira_em, turmaSlot, modalidade_cobertura);
+
+  writeAuditLog({
+    req,
+    categoria: "carencia",
+    acao: "criar",
+    entidade: "quadro_slots",
+    entidade_id: id,
+    resumo: `Criou carência (dia ${dia}, ${periodo}ª) — turma ${turmaSlot}${modalidade_cobertura ? ` · ${modalidade_cobertura}` : ""}`,
+    detalhes: { quadro_id, dia, periodo, tipo, modalidade_cobertura },
+  });
 
   return res.status(201).json(
     db
@@ -2664,11 +3011,41 @@ apiRouter.patch("/quadro-slots/:id/professor", (req, res) => {
        set matricula = null, modalidade_cobertura = null, updated_at = datetime('now')
        where id = ?`,
     ).run(req.params.id);
+    writeAuditLog({
+      req,
+      categoria: "carencia",
+      acao: "remover",
+      entidade: "quadro_slots",
+      entidade_id: req.params.id,
+      resumo: "Removeu substituto de horário em licença (carência permanece aberta)",
+    });
   } else {
     db.prepare(
       `update quadro_slots set matricula = ?, updated_at = datetime('now')
        where id = ?`,
     ).run(matricula, req.params.id);
+    if (matricula) {
+      const profNome = db
+        .prepare("select nome from professores where matricula = ?")
+        .get(matricula) as { nome: string } | undefined;
+      writeAuditLog({
+        req,
+        categoria: "carencia",
+        acao: "atribuir",
+        entidade: "quadro_slots",
+        entidade_id: req.params.id,
+        resumo: `Atribuiu ${profNome?.nome ?? matricula} (${matricula}) a horário de carência`,
+      });
+    } else {
+      writeAuditLog({
+        req,
+        categoria: "carencia",
+        acao: "remover",
+        entidade: "quadro_slots",
+        entidade_id: req.params.id,
+        resumo: "Removeu professor do horário de carência",
+      });
+    }
   }
 
   return res.json(
@@ -2684,29 +3061,133 @@ apiRouter.patch("/quadro-slots/:id/professor", (req, res) => {
   );
 });
 
-/** Abre licença: guarda titular, libera o horário como carência temporária. */
-apiRouter.post("/quadros/:id/licenca", (req, res) => {
-  const quadro_id = req.params.id;
-  const ate = String(req.body?.ate ?? "").trim();
-  const ids = Array.isArray(req.body?.slot_ids)
-    ? (req.body.slot_ids as unknown[]).map(String)
-    : [];
+function hojeISOLocal(): string {
+  const hoje = new Date();
+  const y = hoje.getFullYear();
+  const m = String(hoje.getMonth() + 1).padStart(2, "0");
+  const d = String(hoje.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
 
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(ate)) {
-    return res.status(400).json({ error: "Informe a data de retorno (AAAA-MM-DD)" });
+function registrarLicencaAberta(opts: {
+  matricula: string;
+  slot_id: string;
+  quadro_id: string;
+  retorno_previsto: string;
+  motivo: string | null;
+}) {
+  const meta = db
+    .prepare(
+      `select s.dia, s.periodo, s.turma_codigo,
+              q.turno, q.escola_id, e.nome as escola_nome, d.codigo as disciplina_codigo
+       from quadro_slots s
+       join quadros q on q.id = s.quadro_id
+       left join escolas e on e.id = q.escola_id
+       left join disciplinas d on d.id = q.disciplina_id
+       where s.id = ?`,
+    )
+    .get(opts.slot_id) as
+    | {
+        dia: number;
+        periodo: number;
+        turma_codigo: string | null;
+        turno: string | null;
+        escola_id: string | null;
+        escola_nome: string | null;
+        disciplina_codigo: string | null;
+      }
+    | undefined;
+
+  const existente = db
+    .prepare(
+      `select id from professor_licencas
+       where slot_id = ? and status = 'ABERTA'`,
+    )
+    .get(opts.slot_id) as { id: string } | undefined;
+
+  if (existente) {
+    db.prepare(
+      `update professor_licencas
+       set retorno_previsto = ?, motivo = ?, updated_at = datetime('now')
+       where id = ?`,
+    ).run(opts.retorno_previsto, opts.motivo, existente.id);
+    return;
   }
-  if (ids.length === 0) {
-    return res.status(400).json({ error: "Selecione ao menos um horário" });
-  }
 
-  const quadro = db.prepare("select id from quadros where id = ?").get(quadro_id);
-  if (!quadro) return res.status(404).json({ error: "Quadro não encontrado" });
-
-  const getSlot = db.prepare(
-    `select id, matricula, modalidade_cobertura, titular_matricula
-     from quadro_slots where id = ? and quadro_id = ?`,
+  db.prepare(
+    `insert into professor_licencas (
+       id, matricula, slot_id, quadro_id, escola_id, escola_nome,
+       turma_codigo, turno, disciplina_codigo, dia, periodo,
+       inicio, retorno_previsto, motivo, status
+     ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ABERTA')`,
+  ).run(
+    uuid(),
+    opts.matricula,
+    opts.slot_id,
+    opts.quadro_id,
+    meta?.escola_id ?? null,
+    meta?.escola_nome ?? null,
+    meta?.turma_codigo ?? null,
+    meta?.turno ?? null,
+    meta?.disciplina_codigo ?? null,
+    meta?.dia ?? null,
+    meta?.periodo ?? null,
+    hojeISOLocal(),
+    opts.retorno_previsto,
+    opts.motivo,
   );
-  const upd = db.prepare(
+}
+
+function encerrarLicencaHistorico(slot_id: string) {
+  db.prepare(
+    `update professor_licencas
+     set status = 'ENCERRADA',
+         encerrada_em = ?,
+         updated_at = datetime('now')
+     where slot_id = ? and status = 'ABERTA'`,
+  ).run(hojeISOLocal(), slot_id);
+}
+
+type SlotLicencaRow = {
+  id: string;
+  quadro_id: string;
+  matricula: string | null;
+  modalidade_cobertura: string | null;
+  titular_matricula: string | null;
+};
+
+function abrirLicencaNoSlot(
+  slot: SlotLicencaRow,
+  ate: string,
+  motivo: string | null,
+): { ok: true } | { ok: false; erro: string } {
+  if (slot.titular_matricula) {
+    db.prepare(
+      `update quadro_slots
+       set tipo = 'TEMPORARIA', expira_em = ?, updated_at = datetime('now')
+       where id = ?`,
+    ).run(ate, slot.id);
+    registrarLicencaAberta({
+      matricula: slot.titular_matricula,
+      slot_id: slot.id,
+      quadro_id: slot.quadro_id,
+      retorno_previsto: ate,
+      motivo,
+    });
+    return { ok: true };
+  }
+  if (!slot.matricula) {
+    return {
+      ok: false,
+      erro: "Só é possível abrir licença em horário com professor atribuído",
+    };
+  }
+  const modalidade =
+    slot.modalidade_cobertura === "NORMAL" ||
+    slot.modalidade_cobertura === "HORA_EXTRA"
+      ? slot.modalidade_cobertura
+      : null;
+  db.prepare(
     `update quadro_slots
      set titular_matricula = ?,
          titular_modalidade = ?,
@@ -2716,42 +3197,109 @@ apiRouter.post("/quadros/:id/licenca", (req, res) => {
          expira_em = ?,
          updated_at = datetime('now')
      where id = ?`,
-  );
+  ).run(slot.matricula, modalidade, ate, slot.id);
+  registrarLicencaAberta({
+    matricula: slot.matricula,
+    slot_id: slot.id,
+    quadro_id: slot.quadro_id,
+    retorno_previsto: ate,
+    motivo,
+  });
+  return { ok: true };
+}
+
+/** Abre licença em todos os horários do(s) professor(es) em qualquer quadro. */
+apiRouter.post("/quadros/:id/licenca", (req, res) => {
+  invalidateCarenciasContagensCache();
+  const quadro_id = req.params.id;
+  const ate = String(req.body?.ate ?? "").trim();
+  const motivo = String(req.body?.motivo ?? "").trim() || null;
+  const ids = Array.isArray(req.body?.slot_ids)
+    ? (req.body.slot_ids as unknown[]).map(String)
+    : [];
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ate)) {
+    return res.status(400).json({ error: "Informe a data de retorno (AAAA-MM-DD)" });
+  }
+  if (!motivo) {
+    return res.status(400).json({ error: "Informe o motivo da licença" });
+  }
+  if (ids.length === 0) {
+    return res.status(400).json({ error: "Selecione ao menos um horário" });
+  }
+
+  const quadro = db.prepare("select id from quadros where id = ?").get(quadro_id);
+  if (!quadro) return res.status(404).json({ error: "Quadro não encontrado" });
+
+  const placeholders = ids.map(() => "?").join(",");
+  const selecionados = db
+    .prepare(
+      `select id, quadro_id, matricula, modalidade_cobertura, titular_matricula
+       from quadro_slots
+       where quadro_id = ? and id in (${placeholders})`,
+    )
+    .all(quadro_id, ...ids) as SlotLicencaRow[];
+
+  const matriculas = [
+    ...new Set(
+      selecionados
+        .map((s) => s.titular_matricula || s.matricula)
+        .filter((m): m is string => !!m),
+    ),
+  ];
+
+  if (matriculas.length === 0) {
+    return res.status(400).json({
+      error: "Selecione horários com professor para abrir licença",
+    });
+  }
+
+  const matPlaceholders = matriculas.map(() => "?").join(",");
+  const todosSlots = db
+    .prepare(
+      `select id, quadro_id, matricula, modalidade_cobertura, titular_matricula
+       from quadro_slots
+       where matricula in (${matPlaceholders})
+          or titular_matricula in (${matPlaceholders})`,
+    )
+    .all(...matriculas, ...matriculas) as SlotLicencaRow[];
 
   let updated = 0;
   const erros: string[] = [];
-  for (const id of ids) {
-    const slot = getSlot.get(id, quadro_id) as
-      | {
-          id: string;
-          matricula: string | null;
-          modalidade_cobertura: string | null;
-          titular_matricula: string | null;
-        }
-      | undefined;
-    if (!slot) {
-      erros.push(`Slot ${id} não encontrado`);
+  const quadrosAtingidos = new Set<string>();
+
+  for (const slot of todosSlots) {
+    const titular = slot.titular_matricula || slot.matricula;
+    if (!titular || !matriculas.includes(titular)) continue;
+    const result = abrirLicencaNoSlot(slot, ate, motivo);
+    if (!result.ok) {
+      erros.push(result.erro);
       continue;
     }
-    if (slot.titular_matricula) {
-      // Já em licença: só atualiza a data de retorno
-      db.prepare(
-        `update quadro_slots set tipo = 'TEMPORARIA', expira_em = ?, updated_at = datetime('now')
-         where id = ?`,
-      ).run(ate, id);
-      updated += 1;
-      continue;
-    }
-    if (!slot.matricula) {
-      erros.push("Só é possível abrir licença em horário com professor atribuído");
-      continue;
-    }
-    const modalidade =
-      slot.modalidade_cobertura === "NORMAL" || slot.modalidade_cobertura === "HORA_EXTRA"
-        ? slot.modalidade_cobertura
-        : null;
-    upd.run(slot.matricula, modalidade, ate, id);
     updated += 1;
+    quadrosAtingidos.add(slot.quadro_id);
+  }
+
+  if (updated > 0) {
+    writeAuditLog({
+      req,
+      categoria: "carencia",
+      acao: "licenca_abrir",
+      entidade: "quadros",
+      entidade_id: quadro_id,
+      resumo: `Abriu licença em ${updated} horário(s) de ${matriculas.length} professor(es) — retorno ${ate}${
+        motivo ? ` · ${motivo}` : ""
+      }`,
+      detalhes: {
+        slot_ids: ids,
+        matriculas,
+        ate,
+        motivo,
+        updated,
+        quadros: [...quadrosAtingidos],
+        erros: erros.length,
+      },
+    });
   }
 
   const slots = db
@@ -2765,11 +3313,18 @@ apiRouter.post("/quadros/:id/licenca", (req, res) => {
     )
     .all(quadro_id);
 
-  return res.json({ updated, erros, slots });
+  return res.json({
+    updated,
+    erros,
+    slots,
+    matriculas,
+    quadros_atingidos: quadrosAtingidos.size,
+  });
 });
 
-/** Encerra licença: devolve o horário ao titular e remove o substituto. */
+/** Encerra licença em todos os horários do(s) titular(es) em qualquer quadro. */
 apiRouter.post("/quadros/:id/encerrar-licenca", (req, res) => {
+  invalidateCarenciasContagensCache();
   const quadro_id = req.params.id;
   const ids = Array.isArray(req.body?.slot_ids)
     ? (req.body.slot_ids as unknown[]).map(String)
@@ -2782,10 +3337,46 @@ apiRouter.post("/quadros/:id/encerrar-licenca", (req, res) => {
   const quadro = db.prepare("select id from quadros where id = ?").get(quadro_id);
   if (!quadro) return res.status(404).json({ error: "Quadro não encontrado" });
 
-  const getSlot = db.prepare(
-    `select id, titular_matricula, titular_modalidade
-     from quadro_slots where id = ? and quadro_id = ?`,
-  );
+  const placeholders = ids.map(() => "?").join(",");
+  const selecionados = db
+    .prepare(
+      `select id, titular_matricula, titular_modalidade
+       from quadro_slots
+       where quadro_id = ? and id in (${placeholders})`,
+    )
+    .all(quadro_id, ...ids) as Array<{
+    id: string;
+    titular_matricula: string | null;
+    titular_modalidade: string | null;
+  }>;
+
+  const matriculas = [
+    ...new Set(
+      selecionados
+        .map((s) => s.titular_matricula)
+        .filter((m): m is string => !!m),
+    ),
+  ];
+
+  if (matriculas.length === 0) {
+    return res.status(400).json({
+      error: "Selecione horários em licença para encerrar",
+    });
+  }
+
+  const matPlaceholders = matriculas.map(() => "?").join(",");
+  const todosSlots = db
+    .prepare(
+      `select id, titular_matricula, titular_modalidade
+       from quadro_slots
+       where titular_matricula in (${matPlaceholders})`,
+    )
+    .all(...matriculas) as Array<{
+    id: string;
+    titular_matricula: string | null;
+    titular_modalidade: string | null;
+  }>;
+
   const upd = db.prepare(
     `update quadro_slots
      set matricula = ?,
@@ -2799,25 +3390,23 @@ apiRouter.post("/quadros/:id/encerrar-licenca", (req, res) => {
   );
 
   let updated = 0;
-  const erros: string[] = [];
-  for (const id of ids) {
-    const slot = getSlot.get(id, quadro_id) as
-      | {
-          id: string;
-          titular_matricula: string | null;
-          titular_modalidade: string | null;
-        }
-      | undefined;
-    if (!slot) {
-      erros.push(`Slot ${id} não encontrado`);
-      continue;
-    }
-    if (!slot.titular_matricula) {
-      erros.push("Horário sem licença aberta");
-      continue;
-    }
-    upd.run(slot.titular_matricula, slot.titular_modalidade, id);
+  for (const slot of todosSlots) {
+    if (!slot.titular_matricula) continue;
+    upd.run(slot.titular_matricula, slot.titular_modalidade, slot.id);
+    encerrarLicencaHistorico(slot.id);
     updated += 1;
+  }
+
+  if (updated > 0) {
+    writeAuditLog({
+      req,
+      categoria: "carencia",
+      acao: "licenca_encerrar",
+      entidade: "quadros",
+      entidade_id: quadro_id,
+      resumo: `Encerrou licença em ${updated} horário(s) de ${matriculas.length} professor(es)`,
+      detalhes: { slot_ids: ids, matriculas, updated },
+    });
   }
 
   const slots = db
@@ -2831,7 +3420,256 @@ apiRouter.post("/quadros/:id/encerrar-licenca", (req, res) => {
     )
     .all(quadro_id);
 
-  return res.json({ updated, erros, slots });
+  return res.json({ updated, erros: [] as string[], slots, matriculas });
+});
+
+function parseLicencaIds(body: unknown): string[] {
+  const raw = (body as { ids?: unknown } | null)?.ids;
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(raw.map(String).filter(Boolean))];
+}
+
+/** Lista licenças (histórico) com professor — para Configuração. */
+apiRouter.get("/licencas", (req, res) => {
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 20));
+  const q = String(req.query.q ?? "").trim();
+  const incluirInativas = String(req.query.incluir_inativas ?? "") === "1";
+  const statusFiltro = String(req.query.status ?? "").toLowerCase();
+
+  const where: string[] = [];
+  const params: unknown[] = [];
+
+  if (statusFiltro === "ativas") {
+    where.push("ifnull(l.ativo, 1) = 1");
+  } else if (statusFiltro === "inativas") {
+    where.push("ifnull(l.ativo, 1) = 0");
+  } else if (!incluirInativas) {
+    where.push("ifnull(l.ativo, 1) = 1");
+  }
+
+  if (q) {
+    where.push(
+      `(l.matricula like ? or ifnull(p.nome,'') like ? or ifnull(l.escola_nome,'') like ? or ifnull(l.turma_codigo,'') like ?)`,
+    );
+    const like = `%${q}%`;
+    params.push(like, like, like, like);
+  }
+
+  const whereSql = where.length > 0 ? `where ${where.join(" and ")}` : "";
+
+  const rows = db
+    .prepare(
+      `select l.*, p.nome as professor_nome
+       from professor_licencas l
+       left join professores p on p.matricula = l.matricula
+       ${whereSql}
+       order by
+         case when ifnull(l.ativo, 1) = 1 then 0 else 1 end,
+         l.inicio desc,
+         l.created_at desc`,
+    )
+    .all(...params) as Array<Record<string, unknown>>;
+
+  // Agrupa por professor + datas + status + ativo (mesma “licença”)
+  type Grupo = {
+    ids: string[];
+    matricula: string;
+    professor_nome: string | null;
+    inicio: string;
+    retorno_previsto: string;
+    encerrada_em: string | null;
+    motivo: string | null;
+    status: string;
+    ativo: number;
+    inativado_em: string | null;
+    escolas: string[];
+    turmas: string[];
+    turnos: string[];
+    disciplinas: string[];
+    tempos: number;
+  };
+
+  const groups = new Map<string, Grupo>();
+  for (const row of rows) {
+    const ativo = Number(row.ativo ?? 1) !== 0 ? 1 : 0;
+    const key = [
+      row.matricula,
+      row.status,
+      row.inicio,
+      row.retorno_previsto,
+      row.encerrada_em ?? "",
+      row.motivo ?? "",
+      ativo,
+    ].join("|");
+    const existing = groups.get(key);
+    const pushUnique = (arr: string[], value: unknown) => {
+      const v = String(value ?? "").trim();
+      if (!v || arr.includes(v)) return;
+      arr.push(v);
+    };
+    if (!existing) {
+      groups.set(key, {
+        ids: [String(row.id)],
+        matricula: String(row.matricula),
+        professor_nome: (row.professor_nome as string | null) ?? null,
+        inicio: String(row.inicio),
+        retorno_previsto: String(row.retorno_previsto),
+        encerrada_em: (row.encerrada_em as string | null) ?? null,
+        motivo: (row.motivo as string | null) ?? null,
+        status: String(row.status),
+        ativo,
+        inativado_em: (row.inativado_em as string | null) ?? null,
+        escolas: [],
+        turmas: [],
+        turnos: [],
+        disciplinas: [],
+        tempos: 1,
+      });
+      const g = groups.get(key)!;
+      pushUnique(g.escolas, row.escola_nome);
+      pushUnique(g.turmas, row.turma_codigo);
+      pushUnique(g.turnos, row.turno);
+      pushUnique(g.disciplinas, row.disciplina_codigo);
+      continue;
+    }
+    existing.ids.push(String(row.id));
+    existing.tempos += 1;
+    if (!existing.inativado_em && row.inativado_em) {
+      existing.inativado_em = String(row.inativado_em);
+    }
+    if (!existing.motivo && row.motivo) {
+      existing.motivo = String(row.motivo);
+    }
+    pushUnique(existing.escolas, row.escola_nome);
+    pushUnique(existing.turmas, row.turma_codigo);
+    pushUnique(existing.turnos, row.turno);
+    pushUnique(existing.disciplinas, row.disciplina_codigo);
+  }
+
+  const all = [...groups.values()].map((g) => ({
+    id: g.ids[0],
+    ids: g.ids,
+    matricula: g.matricula,
+    professor_nome: g.professor_nome,
+    inicio: g.inicio,
+    retorno_previsto: g.retorno_previsto,
+    encerrada_em: g.encerrada_em,
+    motivo: g.motivo,
+    status: g.status,
+    ativo: g.ativo,
+    inativado_em: g.inativado_em,
+    escola_nome: g.escolas.sort((a, b) => a.localeCompare(b, "pt-BR")).join(" · "),
+    turma_codigo: g.turmas.sort((a, b) => a.localeCompare(b, "pt-BR")).join(" · "),
+    turno: g.turnos.sort((a, b) => a.localeCompare(b, "pt-BR")).join(" · ") || null,
+    disciplina_codigo: g.disciplinas
+      .sort((a, b) => a.localeCompare(b, "pt-BR"))
+      .join(" · "),
+    tempos: g.tempos,
+  }));
+
+  const total = all.length;
+  const start = (page - 1) * pageSize;
+  const items = all.slice(start, start + pageSize);
+
+  res.json({ items, total, page, pageSize });
+});
+
+apiRouter.post("/licencas/inativar", (req, res) => {
+  const ids = parseLicencaIds(req.body);
+  if (ids.length === 0) {
+    return res.status(400).json({ error: "Informe os ids da licença" });
+  }
+  const placeholders = ids.map(() => "?").join(",");
+  const result = db
+    .prepare(
+      `update professor_licencas
+       set ativo = 0, inativado_em = datetime('now'), updated_at = datetime('now')
+       where id in (${placeholders}) and ifnull(ativo, 1) = 1`,
+    )
+    .run(...ids);
+
+  if (result.changes > 0) {
+    writeAuditLog({
+      req,
+      categoria: "carencia",
+      acao: "inativar",
+      entidade: "professor_licencas",
+      entidade_id: ids[0] ?? null,
+      resumo: `Inativou licença (${result.changes} registro(s))`,
+      detalhes: { ids, changes: result.changes },
+    });
+  }
+
+  return res.json({ inativadas: result.changes });
+});
+
+apiRouter.post("/licencas/reativar", (req, res) => {
+  const ids = parseLicencaIds(req.body);
+  if (ids.length === 0) {
+    return res.status(400).json({ error: "Informe os ids da licença" });
+  }
+  const placeholders = ids.map(() => "?").join(",");
+  const result = db
+    .prepare(
+      `update professor_licencas
+       set ativo = 1, inativado_em = null, updated_at = datetime('now')
+       where id in (${placeholders}) and ifnull(ativo, 1) = 0`,
+    )
+    .run(...ids);
+
+  if (result.changes > 0) {
+    writeAuditLog({
+      req,
+      categoria: "carencia",
+      acao: "reativar",
+      entidade: "professor_licencas",
+      entidade_id: ids[0] ?? null,
+      resumo: `Reativou licença (${result.changes} registro(s))`,
+      detalhes: { ids, changes: result.changes },
+    });
+  }
+
+  return res.json({ reativadas: result.changes });
+});
+
+apiRouter.post("/licencas/excluir", requireAdmin, (req, res) => {
+  const ids = parseLicencaIds(req.body);
+  if (ids.length === 0) {
+    return res.status(400).json({ error: "Informe os ids da licença" });
+  }
+
+  const placeholders = ids.map(() => "?").join(",");
+  const ativas = db
+    .prepare(
+      `select count(*) as c from professor_licencas
+       where id in (${placeholders}) and ifnull(ativo, 1) = 1`,
+    )
+    .get(...ids) as { c: number };
+
+  if (ativas.c > 0) {
+    return res.status(400).json({
+      error: "Só é possível excluir licenças já inativadas",
+    });
+  }
+
+  const result = db
+    .prepare(`delete from professor_licencas where id in (${placeholders})`)
+    .run(...ids);
+
+  if (result.changes > 0) {
+    writeAuditLog({
+      req,
+      categoria: "carencia",
+      acao: "excluir",
+      entidade: "professor_licencas",
+      entidade_id: ids[0] ?? null,
+      resumo: `Excluiu licença (${result.changes} registro(s))`,
+      detalhes: { ids, changes: result.changes },
+    });
+  }
+
+  return res.json({ excluidas: result.changes });
 });
 
 apiRouter.post("/quadros/:id/atribuir", (req, res) => {
@@ -2841,6 +3679,11 @@ apiRouter.post("/quadros/:id/atribuir", (req, res) => {
   const ids = Array.isArray(req.body?.slot_ids)
     ? (req.body.slot_ids as unknown[]).map(String)
     : [];
+  const modalidadeRaw = String(req.body?.modalidade_cobertura ?? "").toUpperCase();
+  const modalidade_cobertura: string | null =
+    modalidadeRaw === "NORMAL" || modalidadeRaw === "HORA_EXTRA"
+      ? modalidadeRaw
+      : null;
 
   if (!matricula) {
     return res.status(400).json({ error: "Informe o professor" });
@@ -2854,14 +3697,41 @@ apiRouter.post("/quadros/:id/atribuir", (req, res) => {
     .get(matricula);
   if (!prof) return res.status(400).json({ error: "Professor não encontrado" });
 
-  const update = db.prepare(
-    `update quadro_slots set matricula = ?, updated_at = datetime('now')
-     where id = ? and quadro_id = ?`,
-  );
+  const update = modalidade_cobertura
+    ? db.prepare(
+        `update quadro_slots
+         set matricula = ?, modalidade_cobertura = ?, updated_at = datetime('now')
+         where id = ? and quadro_id = ?`,
+      )
+    : db.prepare(
+        `update quadro_slots set matricula = ?, updated_at = datetime('now')
+         where id = ? and quadro_id = ?`,
+      );
 
   let updated = 0;
   for (const id of ids) {
-    updated += Number(update.run(matricula, id, quadro_id).changes);
+    updated += Number(
+      modalidade_cobertura
+        ? update.run(matricula, modalidade_cobertura, id, quadro_id).changes
+        : update.run(matricula, id, quadro_id).changes,
+    );
+  }
+
+  if (updated > 0) {
+    const profNome = db
+      .prepare("select nome from professores where matricula = ?")
+      .get(matricula) as { nome: string } | undefined;
+    writeAuditLog({
+      req,
+      categoria: "carencia",
+      acao: "atribuir",
+      entidade: "quadros",
+      entidade_id: quadro_id,
+      resumo: `Atribuiu ${profNome?.nome ?? matricula} (${matricula}) a ${updated} horário(s) de carência${
+        modalidade_cobertura ? ` · ${modalidade_cobertura}` : ""
+      }`,
+      detalhes: { slot_ids: ids, matricula, modalidade_cobertura },
+    });
   }
 
   const slots = db
@@ -2998,7 +3868,7 @@ apiRouter.post("/quadros/mesclar", (req, res) => {
       /* ignore */
     }
     return res.status(500).json({
-      error: err instanceof Error ? err.message : "Erro ao mesclar quadros",
+      error: clientErrorMessage(err, "Erro ao mesclar quadros"),
     });
   }
 });
@@ -3088,51 +3958,20 @@ apiRouter.post("/quadros/:id/desmembrar", (req, res) => {
     const novoTurmaLabel = turmaLabel(turmasParaDesmembrar);
     const novoTurmasJson = JSON.stringify(turmasParaDesmembrar);
 
-    // Usa um label temporário para o quadro original (para liberar o constraint)
-    const tempLabel = `__TEMP_${quadroId}__`;
+    // Sempre cria um quadro novo (pode haver vários da mesma turma)
+    const novoQuadroId = uuid();
     db.prepare(
-      `update quadros set turma_codigo = ?, updated_at = datetime('now') where id = ?`,
-    ).run(tempLabel, quadroId);
-
-    // Verifica se já existe um quadro com o mesmo turma_codigo
-    const existente = db
-      .prepare(
-        `select id from quadros where escola_id = ? and turma_codigo = ? and turno = ? and disciplina_id is ? and id != ?`,
-      )
-      .get(quadro.escola_id, novoTurmaLabel, quadro.turno, quadro.disciplina_id, quadroId) as
-      | { id: string }
-      | undefined;
-
-    let novoQuadroId: string;
-
-    if (existente) {
-      // Quadro já existe, move os slots para ele
-      novoQuadroId = existente.id;
-      // Atualiza as turmas do quadro existente para incluir as novas
-      const existenteTurmasJson = db
-        .prepare("select turmas_json, turma_codigo from quadros where id = ?")
-        .get(existente.id) as { turmas_json: string | null; turma_codigo: string };
-      const existenteTurmas = parseTurmasJson(existenteTurmasJson.turmas_json, existenteTurmasJson.turma_codigo);
-      const turmasMescladas = normalizeTurmas([...existenteTurmas, ...turmasParaDesmembrar]);
-      db.prepare(
-        `update quadros set turma_codigo = ?, turmas_json = ?, updated_at = datetime('now') where id = ?`,
-      ).run(turmaLabel(turmasMescladas), JSON.stringify(turmasMescladas), existente.id);
-    } else {
-      // Cria novo quadro
-      novoQuadroId = uuid();
-      db.prepare(
-        `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
-         values (?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        novoQuadroId,
-        quadro.escola_id,
-        novoTurmaLabel,
-        quadro.turno,
-        quadro.disciplina_id,
-        quadro.observacao,
-        novoTurmasJson,
-      );
-    }
+      `insert into quadros (id, escola_id, turma_codigo, turno, disciplina_id, observacao, turmas_json)
+       values (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      novoQuadroId,
+      quadro.escola_id,
+      novoTurmaLabel,
+      quadro.turno,
+      quadro.disciplina_id,
+      quadro.observacao,
+      novoTurmasJson,
+    );
 
     // Move os slots para o novo quadro
     for (const slot of slots) {
@@ -3181,7 +4020,7 @@ apiRouter.post("/quadros/:id/desmembrar", (req, res) => {
       turmas_desmembradas: turmasParaDesmembrar,
       turmas_restantes: turmasComSlots,
       slots_movidos: slots.length,
-      mesclado_com_existente: !!existente,
+      mesclado_com_existente: false,
     });
   } catch (err) {
     try {
@@ -3190,15 +4029,124 @@ apiRouter.post("/quadros/:id/desmembrar", (req, res) => {
       /* ignore */
     }
     return res.status(500).json({
-      error: err instanceof Error ? err.message : "Erro ao desmembrar",
+      error: clientErrorMessage(err, "Erro ao desmembrar"),
     });
   }
 });
 
 // Dashboard
-apiRouter.get("/dashboard", (_req, res) => {
+/** Opções dinâmicas de filtro (categorias/ações que existem nos logs). */
+apiRouter.get("/logs/filtros", requireAdmin, (req, res) => {
+  const categoria = String(req.query.categoria ?? "").trim().toLowerCase();
+  const catParams: string[] = [];
+  let catWhere = "";
+  if (
+    categoria === "hora_extra" ||
+    categoria === "carencia" ||
+    categoria === "professores" ||
+    categoria === "escolas" ||
+    categoria === "disciplinas" ||
+    categoria === "alocacoes" ||
+    categoria === "sistema"
+  ) {
+    catWhere = " where categoria = ?";
+    catParams.push(categoria);
+  }
+
+  const categorias = db
+    .prepare(
+      `select categoria as id, count(*) as total
+       from audit_logs
+       group by categoria
+       order by total desc, categoria collate nocase`,
+    )
+    .all() as Array<{ id: string; total: number }>;
+
+  const acoes = db
+    .prepare(
+      `select acao as id, count(*) as total
+       from audit_logs${catWhere}
+       group by acao
+       order by total desc, acao collate nocase`,
+    )
+    .all(...catParams) as Array<{ id: string; total: number }>;
+
+  res.json({ categorias, acoes });
+});
+
+/** Logs de auditoria (configuração). */
+apiRouter.get("/logs", requireAdmin, (req, res) => {
+  const { paginated, page, pageSize, offset, like } = listQuery(req);
+  const categoria = String(req.query.categoria ?? "").trim().toLowerCase();
+  const acao = String(req.query.acao ?? "").trim().toLowerCase();
+
+  const clauses: string[] = [];
+  const params: Array<string | number> = [];
+
+  if (
+    categoria === "hora_extra" ||
+    categoria === "carencia" ||
+    categoria === "professores" ||
+    categoria === "escolas" ||
+    categoria === "disciplinas" ||
+    categoria === "alocacoes" ||
+    categoria === "sistema"
+  ) {
+    clauses.push("categoria = ?");
+    params.push(categoria);
+  }
+  if (acao) {
+    clauses.push("acao = ?");
+    params.push(acao);
+  }
+  if (like) {
+    clauses.push(
+      `(resumo like ? collate nocase
+        or ifnull(user_nome,'') like ? collate nocase
+        or ifnull(user_email,'') like ? collate nocase
+        or ifnull(entidade_id,'') like ? collate nocase)`,
+    );
+    params.push(like, like, like, like);
+  }
+
+  const where = clauses.length ? ` where ${clauses.join(" and ")}` : "";
+
+  if (!paginated) {
+    return res.json(
+      db
+        .prepare(
+          `select * from audit_logs${where}
+           order by created_at desc
+           limit 500`,
+        )
+        .all(...params),
+    );
+  }
+
+  const total = (
+    db
+      .prepare(`select count(*) as c from audit_logs${where}`)
+      .get(...params) as { c: number }
+  ).c;
+
+  const items = db
+    .prepare(
+      `select * from audit_logs${where}
+       order by created_at desc
+       limit ? offset ?`,
+    )
+    .all(...params, pageSize, offset);
+
+  res.json({ items, total, page, pageSize });
+});
+
+apiRouter.get("/dashboard", (req, res) => {
+  inativarHorasExtraExpiradas(req, true);
   const now = new Date();
   const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+
+  /** Só HEs ativas entram nos totais do dashboard. */
+  const heAtivaSql = "coalesce(ativo, 1) = 1";
 
   const professores = (
     db.prepare("select count(*) as c from professores").get() as { c: number }
@@ -3215,18 +4163,22 @@ apiRouter.get("/dashboard", (_req, res) => {
       .prepare(
         `select coalesce(sum(tempos_autorizados), 0) as t
          from horas_extra
-         where (inicio is null or inicio <= ?)
+         where ${heAtivaSql}
+           and (inicio is null or inicio <= ?)
            and (termino is null or termino >= ?)`,
       )
       .get(today, today) as { t: number }
   ).t;
 
+  // Expiradas = já inativadas (ou ainda ativas) com término anterior a hoje
   const heExpirada = (
     db
       .prepare(
         `select count(*) as c
          from horas_extra
-         where termino is not null and termino < ?`,
+         where termino is not null
+           and trim(termino) != ''
+           and date(substr(termino, 1, 10)) < date(?)`,
       )
       .get(today) as { c: number }
   ).c;
@@ -3264,7 +4216,8 @@ apiRouter.get("/dashboard", (_req, res) => {
     db
       .prepare(
         `select count(*) as c from horas_extra
-         where termino is null or termino >= ?`,
+         where ${heAtivaSql}
+           and (termino is null or termino >= ?)`,
       )
       .get(today) as { c: number }
   ).c;
@@ -3274,7 +4227,8 @@ apiRouter.get("/dashboard", (_req, res) => {
       `with he as (
          select matricula, sum(tempos_autorizados) as he
          from horas_extra
-         where (inicio is null or inicio <= ?)
+         where ${heAtivaSql}
+           and (inicio is null or inicio <= ?)
            and (termino is null or termino >= ?)
          group by matricula
        ),
@@ -3313,6 +4267,24 @@ apiRouter.get("/dashboard", (_req, res) => {
     )
     .all(today, today);
 
+  const heAVencer = db
+    .prepare(
+      `select h.id,
+              h.matricula,
+              p.nome as professor_nome,
+              h.tempos_autorizados,
+              h.tipo,
+              substr(h.termino, 1, 10) as termino
+       from horas_extra h
+       join professores p on p.matricula = h.matricula
+       where ${heAtivaSql}
+         and h.termino is not null
+         and trim(h.termino) != ''
+         and date(substr(h.termino, 1, 10)) >= date(?)
+       order by date(substr(h.termino, 1, 10)) asc, p.nome collate nocase`,
+    )
+    .all(today);
+
   res.json({
     professores,
     escolas: escolasCount,
@@ -3324,5 +4296,6 @@ apiRouter.get("/dashboard", (_req, res) => {
     carenciaTotal,
     carenciaAberta,
     inconsistentes,
+    heAVencer,
   });
 });

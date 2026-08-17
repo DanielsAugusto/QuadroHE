@@ -24,6 +24,7 @@ import {
   inputClass,
 } from "@/components/ui";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import type { Paginated, Professor } from "@/lib/types";
 
 const emptyForm = { matricula: "", nome: "", cargo: "", funcao: "" };
@@ -353,6 +354,7 @@ export function ProfessoresPage({
 }: {
   embedded?: boolean;
 }) {
+  const { isAdmin } = useAuth();
   const [itens, setItens] = useState<Professor[]>([]);
   const [total, setTotal] = useState(0);
   const [form, setForm] = useState(emptyForm);
@@ -513,29 +515,33 @@ export function ProfessoresPage({
 
   const actions = (
     <>
-      <input
-        ref={fileRef}
-        type="file"
-        accept=".xlsx,.xls,.csv"
-        className="hidden"
-        onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
-      />
-      <button
-        type="button"
-        className={btnDanger}
-        disabled={importing || deleting || (total === 0 && !busca.trim())}
-        onClick={() => setPendingDeleteAll(true)}
-      >
-        Apagar tudo
-      </button>
-      <button
-        type="button"
-        className={btnSecondary}
-        disabled={importing}
-        onClick={() => fileRef.current?.click()}
-      >
-        {importing ? "Importando..." : "Importar Excel"}
-      </button>
+      {isAdmin ? (
+        <>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            className="hidden"
+            onChange={(e) => void onImportFile(e.target.files?.[0] ?? null)}
+          />
+          <button
+            type="button"
+            className={btnDanger}
+            disabled={importing || deleting || (total === 0 && !busca.trim())}
+            onClick={() => setPendingDeleteAll(true)}
+          >
+            Apagar tudo
+          </button>
+          <button
+            type="button"
+            className={btnSecondary}
+            disabled={importing}
+            onClick={() => fileRef.current?.click()}
+          >
+            {importing ? "Importando..." : "Importar Excel"}
+          </button>
+        </>
+      ) : null}
       <button type="button" className={btnPrimary} onClick={abrirNovo}>
         Novo professor
       </button>
@@ -619,10 +625,12 @@ export function ProfessoresPage({
                             label={`Editar ${p.nome}`}
                             onClick={() => abrirEditar(p)}
                           />
-                          <IconDeleteButton
-                            label={`Excluir ${p.nome}`}
-                            onClick={() => setPendingDelete(p)}
-                          />
+                          {isAdmin ? (
+                            <IconDeleteButton
+                              label={`Excluir ${p.nome}`}
+                              onClick={() => setPendingDelete(p)}
+                            />
+                          ) : null}
                         </div>
                       </td>
                     </tr>

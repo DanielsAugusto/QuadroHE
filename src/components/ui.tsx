@@ -10,8 +10,8 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-      <div>
+    <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
+      <div className="min-w-0 flex-1">
         <h1 className="font-display text-3xl font-semibold text-brand-dark">
           {title}
         </h1>
@@ -19,7 +19,11 @@ export function PageHeader({
           <p className="mt-1 max-w-2xl text-sm text-muted">{description}</p>
         ) : null}
       </div>
-      {actions ? <div className="flex flex-wrap gap-2">{actions}</div> : null}
+      {actions ? (
+        <div className="flex w-full shrink-0 flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
+          {actions}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -280,6 +284,86 @@ export function IconDeleteButton({
           strokeLinecap="round"
           strokeLinejoin="round"
           d="M6 7h12M9.5 7V5.5A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5V7m-7 0 1 12h8l1-12m-7.5 4v5m3-5v5"
+        />
+      </svg>
+    </button>
+  );
+}
+
+/** Botão com X — usado para inativar (não excluir). */
+export function IconCloseButton({
+  label,
+  onClick,
+  disabled,
+  title = "Inativar",
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      aria-label={label}
+      disabled={disabled}
+      className={`${iconBtnBase} border-amber-300 text-amber-800 hover:bg-amber-50`}
+      onClick={onClick}
+    >
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        className="h-4 w-4"
+        aria-hidden
+      >
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          d="M6 6l12 12M18 6L6 18"
+        />
+      </svg>
+    </button>
+  );
+}
+
+/** Botão com check — usado para reativar. */
+export function IconCheckButton({
+  label,
+  onClick,
+  disabled,
+  title = "Reativar",
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      aria-label={label}
+      disabled={disabled}
+      className={`${iconBtnBase} border-emerald-300 text-emerald-700 hover:bg-emerald-50`}
+      onClick={onClick}
+    >
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2.2"
+        className="h-4 w-4"
+        aria-hidden
+      >
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          d="M5 13l4 4L19 7"
         />
       </svg>
     </button>

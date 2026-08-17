@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import {
   EmptyState,
   ErrorBanner,
@@ -43,6 +43,7 @@ export function disciplinaKey(d: Pick<DisciplinaResumo, "disciplina_id" | "codig
 }
 
 export function CarenciasDisciplinasPage() {
+  const location = useLocation();
   const [disciplinas, setDisciplinas] = useState<DisciplinaResumo[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -101,6 +102,7 @@ export function CarenciasDisciplinasPage() {
                 <div className="mt-auto">
                   <Link
                     to={`/carencias/doc1/disciplinas/${key}`}
+                    state={{ from: `${location.pathname}${location.search}` }}
                     className="inline-flex items-center justify-center rounded-md bg-brand px-4 py-2 text-sm font-medium text-white transition hover:bg-brand-dark"
                   >
                     Ver quadros
