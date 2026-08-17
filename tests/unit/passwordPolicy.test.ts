@@ -18,7 +18,7 @@ describe("isWeakAdminPassword (TDD: política do primeiro admin)", () => {
 
   it("aceita senha aleatória com 12+ caracteres", () => {
     expect(isWeakAdminPassword("Kj8#mP2wQx9!")).toBe(false);
-    expect(isWeakAdminPassword("TestAdminPass12!")).toBe(false);
+    expect(isWeakAdminPassword("NaoECredencial99")).toBe(false);
   });
 });
 

@@ -3,7 +3,7 @@ import jwt from "jsonwebtoken";
 import request from "supertest";
 import { beforeEach, describe, expect, it } from "vitest";
 import { db } from "../../server/db.ts";
-import { getTestApp, getUsuarioId, resetTestData } from "../helpers/app.ts";
+import { getTestApp, getUsuarioId, resetTestData, TEST_ADMIN } from "../helpers/app.ts";
 import { loginAdmin, loginOperador } from "../helpers/auth.ts";
 
 function jwtNone(payload: Record<string, unknown>) {
@@ -207,8 +207,8 @@ describe("OWASP Top 10", () => {
 
     it("login define cookie HttpOnly SameSite", async () => {
       const res = await request(app).post("/api/auth/login").send({
-        email: "admin@test.local",
-        password: "TestAdminPass12!",
+        email: TEST_ADMIN.email,
+        password: TEST_ADMIN.password,
       });
       const cookie = String(res.headers["set-cookie"] ?? "");
       expect(cookie).toMatch(/quadrohe_session=/);
@@ -234,8 +234,8 @@ describe("OWASP Top 10", () => {
       ).run(secret, "admin@test.local");
 
       const step1 = await request(app).post("/api/auth/login").send({
-        email: "admin@test.local",
-        password: "TestAdminPass12!",
+        email: TEST_ADMIN.email,
+        password: TEST_ADMIN.password,
       });
       expect(step1.status).toBe(200);
       expect(step1.body.mfa_required).toBe(true);
@@ -263,8 +263,8 @@ describe("OWASP Top 10", () => {
         });
       }
       const locked = await request(app).post("/api/auth/login").send({
-        email: "admin@test.local",
-        password: "TestAdminPass12!",
+        email: TEST_ADMIN.email,
+        password: TEST_ADMIN.password,
       });
       expect(locked.status).toBe(429);
     });
@@ -345,7 +345,8 @@ describe("OWASP Top 10", () => {
         | { acao: string; resumo: string; detalhes: string | null }
         | undefined;
       expect(log?.acao).toBe("login_falha");
-      expect(JSON.stringify(log)).not.toMatch(/senha-errada|senha_hash|TestAdminPass/i);
+      expect(JSON.stringify(log)).not.toMatch(/senha-errada|senha_hash/i);
+      expect(JSON.stringify(log)).not.toContain(TEST_ADMIN.password);
     });
 
     it("login bem-sucedido gera log de acesso", async () => {
@@ -392,7 +393,8 @@ describe("OWASP Top 10", () => {
         )
         .get() as { acao: string; detalhes: string | null } | undefined;
       expect(log?.acao).toBe("alerta");
-      expect(JSON.stringify(log)).not.toMatch(/senha-errada|TestAdminPass/i);
+      expect(JSON.stringify(log)).not.toMatch(/senha-errada/i);
+      expect(JSON.stringify(log)).not.toContain(TEST_ADMIN.password);
     });
 
     it("resposta inclui X-Request-Id", async () => {

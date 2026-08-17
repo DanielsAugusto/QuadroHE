@@ -6,15 +6,23 @@ import { assertAuthSecrets } from "../../server/auth.ts";
 import { db, initDb } from "../../server/db.ts";
 import { bcryptRounds } from "../../server/passwordPolicy.ts";
 
+function requireTestSecret(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} não definido — o setup de teste deve gerar o segredo`);
+  }
+  return value;
+}
+
 export const TEST_ADMIN = {
-  email: "admin@test.local",
-  password: "TestAdminPass12!",
+  email: process.env.ADMIN_EMAIL || "admin@test.local",
+  password: requireTestSecret("ADMIN_PASSWORD"),
   nome: "Administrador",
 };
 
 export const TEST_OPERADOR = {
-  email: "operador@test.local",
-  password: "OperadorPass12!",
+  email: process.env.TEST_OPERADOR_EMAIL || "operador@test.local",
+  password: requireTestSecret("TEST_OPERADOR_PASSWORD"),
   nome: "Operador Teste",
 };
 
